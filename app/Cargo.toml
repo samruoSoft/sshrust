@@ -1,0 +1,19 @@
+[package]
+name = "sshrust-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sshrust-core = { path = "../core" }
+ui-kit = { path = "../ui-kit" }
+gpui = "=0.2.2"
+gpui-terminal = "=0.1.0"
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sys-locale = "0.3.2"
+
+[dev-dependencies]
+gpui = { version = "=0.2.2", features = ["test-support"] }

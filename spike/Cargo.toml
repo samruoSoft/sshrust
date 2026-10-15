@@ -1,0 +1,12 @@
+[package]
+name = "spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sshrust-core = { path = "../core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+rpassword = "7"

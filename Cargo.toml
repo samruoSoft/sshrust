@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["core", "spike", "app", "ui-kit", "third_party/gpui-terminal"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+anyhow = "1"
+thiserror = "2"
+bytes = "1"
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[patch.crates-io]
+gpui-terminal = { path = "third_party/gpui-terminal" }

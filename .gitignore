@@ -1,0 +1,12 @@
+# Rust
+/target
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+.zcode/
+.zcodeignore
