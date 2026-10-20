@@ -18,6 +18,7 @@ use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use crossterm::{execute, terminal};
 
 use sshrust_core::session::{open_session, AuthMethod, ConnectParams, SessionReader};
+use sshrust_core::Transport;
 
 #[derive(Parser, Debug)]
 #[command(name = "spike", about = "russh interactive SSH shell (Phase 0 spike)")]
@@ -62,6 +63,7 @@ fn main() -> Result<()> {
             auth: AuthMethod::Password(sshrust_core::mock::MOCK_PASS.into()),
             cols: 80,
             rows: 24,
+            transport: Transport::Tcp,
         },
         (None, None) => bail!("缺少 <host>（或使用 --mock）"),
     };
@@ -123,7 +125,7 @@ fn build_params(args: &Args, host: String) -> Result<ConnectParams> {
         let pw = rpassword::prompt_password(format!("password for {user}: "))?;
         AuthMethod::Password(pw)
     };
-    Ok(ConnectParams { host, port: args.port, username: user, auth, cols: 80, rows: 24 })
+    Ok(ConnectParams { host, port: args.port, username: user, auth, cols: 80, rows: 24, transport: Transport::Tcp })
 }
 
 fn pump_output(reader: &mut SessionReader) {

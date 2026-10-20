@@ -34,8 +34,8 @@
 - 包装器 `InputField`：边框、尺寸模板（InputSize::Sm/Md）、首/尾图标（svg 或任意元素）、
   `mono` 等宽、聚焦高亮描边
 
-状态：🔄 app 表单全部字段使用中（含 Password 显隐、Number 端口）。
-⏳ 待验证：① Number 框粘贴含非数字文本（应被过滤或忽略）；② Focus/Blur 事件回调时机（当前 app 未消费）。
+状态：✅ app 表单全部字段使用中（含 Password 显隐、Number 端口；Number 粘贴过滤、
+Focus/Blur 事件时机 2026-10-16 验证通过）。
 
 ## base — text_area（TextArea / TextAreaField）
 
@@ -47,8 +47,8 @@
 - 光标跟随视口（仅光标 offset 变化时跟随，**不与用户拖动滚动条打架**）
 - 选择（跨行）、IME marked range（组合下划线）；内容驱动高度（包装器不自算行高）
 
-状态：✅ 自动换行 / X 轴显示与拖拽 / 滚动条贴合视口（第二十六轮修复后确认）。
-⏳ 待验证：① IME 中文组合输入（带下划线标记段）；② 超长无空格串（base64 密钥）硬折行显示。
+状态：✅ 自动换行 / X 轴显示与拖拽 / 滚动条贴合视口（第二十六轮修复后确认）；
+IME 中文组合输入、base64 长串硬折行 2026-10-16 验证通过。
 
 ## base — button / form / modal / dropdown
 
@@ -63,8 +63,8 @@
   贴边翻转锚点 `clamp_origin`、overlay 点击外部关闭（on_dismiss）、`on_select` 回调；
   菜单项带 `debug_selector("menu-item-{i}")` 供进程内测试定位。
 
-状态：🔄 app 右键菜单（dropdown）、确认删除弹窗（modal）、按钮/表单布局使用中。
-⏳ 待验证：dropdown 贴近视口底边/右边缘时的翻转与锚点（当前使用位置都在中部）。
+状态：✅ app 右键菜单（dropdown，含贴近视口底边/右缘翻转）、确认删除弹窗（modal）、
+按钮/表单布局使用中。
 
 ## base — tooltip
 
@@ -77,8 +77,7 @@
   theme 注入。
 - **浮层不吃透明**：卡片用不透明 `rgb(card)`（同 dropdown/modal 红线）。
 
-状态：🔄 app 右缘工具栏按钮使用中（多语言 tooltip）。
-⏳ 待验证：① 悬停延迟时长与消失时机的手感；② 窗口右缘/底部弹出时的翻转。
+状态：✅ app 右缘工具栏按钮使用中（多语言 tooltip；延迟手感、窗缘翻转 2026-10-16 验证通过）。
 
 ## base — panel（Panel / PanelSize）
 
@@ -97,12 +96,11 @@
   标题栏底边框/底栏顶边框与卡片外框同用 theme.border（app 暗色系即分割线基线色）；
   body 包弹性容器（面板定高时占满余量，自然高度时随内容）
 
-状态：🔄 app 系统信息面板五分区使用中（Sm：icon+标题+%徽标 tools+body，无底色
+状态：✅ app 系统信息面板五分区使用中（Sm：icon+标题+%徽标 tools+body，无底色
 `.bg()` 不给；边框=主题 border（app 暗色系即分割线基线色）；**四周 4px 留白**——
 宿主容器 pl/py 4px、右侧 0（内容宽已扣 14px 滚动条区，thumb 左缘 −10 → 卡片右缘距
-thumb 恰 4px 与左对称）、相邻面板间距 8px=4+4；footer 插槽与 Md 模板暂无宿主）。
-⏳ 待验证：① 四周 4px 留白的视觉（右缘与滚动条对称）；② footer 插槽与 Md 模板
-（当前无宿主用例）。
+thumb 恰 4px 与左对称）、相邻面板间距 8px=4+4；留白视觉 2026-10-16 验证通过；
+footer 插槽与 Md 模板暂无宿主用例）。
 
 ## pro — scroll_area
 
@@ -145,29 +143,35 @@ thumb 恰 4px 与左对称）、相邻面板间距 8px=4+4；footer 插槽与 Md
   `DialogSpec.footer_height`（默认 48）
 - `DialogHandle { is_open / activate / close / content }`；内容是任意 `Entity<T: Render>`
 - 首个用例：app 新增/编辑服务器表单（app/src/form_service_edit.rs 作为内容）；
-第二个用例：图标选择器（footer 确定/取消 + 事件回调写回，callback 路径已实测走通与否待用户验证）
+第二个用例：图标选择器（footer 确定/取消 + 事件回调写回，callback 路径实测走通）
 - 终端弹出窗口**有意不用** DialogWindow（工具窗口语义，可最小化/最大化、不置顶）
 
-状态：🔄 app 表单使用中。⏳ 待验证：① 置顶为 app 内（app 激活时浮于主窗口与终端
-弹出窗口之上且点主窗不沉底；切到其他 app 后对话框可被其窗口遮挡，切回后恢复置顶）；
-② 仅关闭按钮（无最小化/最大化）；③ 拖角 resize 内容自适应（表单卡片居中）；
-④ 最小尺寸约束；⑤ 连接成功自动关窗、Esc/⌘W/红绿灯放弃关闭；
-⑥ open_dialog_listening 回调路径（图标选择器落地时验证）。
+状态：✅ app 表单/图标选择器使用中（置顶为 app 内、仅关闭按钮、拖角 resize 自适应、
+最小尺寸约束、连接成功自动关窗、Esc/⌘W/红绿灯关闭、listening 回调路径——
+2026-10-16 全部验证通过）。
 
-## pro — tree（本轮重点，多项待验证）
+## pro — tree
 
 数据模型：`TreeNodeData { id, kind(Header/Group/Leaf), label, icon, icon_open, suffix,
-suffix_ellipsis, dot, colors: NodeColors{icon,text,bg}, children, expanded(首次播种), droppable }`
+suffix_ellipsis, subtitle, badge, dot, colors: NodeColors{icon,text,bg}, children,
+expanded(首次播种), droppable }`
 
 事件（对外全部内聚为事件）：`TreeEvent { Select, Activate(双击), Toggle, ContextMenu{id:Option,position},
 Rename(回车提交；Esc/失焦弃), Move(拖拽) }`
 
 内聚功能：展开状态内部管理（`set_expanded` / `expanded_ids` / `expand(id)` 主动展开单个节点
-——宿主控制动态出现的分组用，其余展开态不动；读写同步）、内联重命名
+——宿主控制动态出现的分组用，其余展开态不动；读写同步；`expand_all` / `collapse_all`
+批量操作——后者只保留最外层分组展开）、内联重命名
 （`begin_rename`，Esc 由 TreeEscape action 处理；**编辑中的行忽略行点击**——否则点进
 输入框会触发选中/折叠，分组行的编辑框被折叠掉即"无法重命名"）、拖拽 ghost +
 droppable 分组高亮、内嵌 scroll_area（真实模式）；行带 `debug_selector("tree-node-{id}")`，
 箭头盒/标题盒另带 `tree-arrow-{id}` / `tree-label-{id}`（对齐回归测试用）。
+
+**简洁/详细双模式**（`set_detail(bool)` / `is_detail()`）：默认简洁 = 单行（标题 +
+行尾 suffix）；详细 = 带 `subtitle` 的节点渲染两行行（行高 ×2−8，行 1 = 标题[弹性省略]
++ 状态点 + `badge` 徽章[带边框小框，9.5px]，行 2 = subtitle[10px 弱化、尾部省略]），
+图标在行外垂直居中跨两行；编辑态与无 subtitle 节点保持单行。suffix/subtitle 可并存
+（简洁显示前者、详细显示后者）。行高逐行设置（编辑行 +4、两行行更高），变高行安全。
 
 视觉约定（第二十八/二十九轮定稿；第五十轮补箭头槽位语义）：
 - 行高 26、缩进 14/级；行内元素（箭头/图标/标题/状态点/后缀）统一 **16px 等高盒**，
@@ -183,8 +187,8 @@ droppable 分组高亮、内嵌 scroll_area（真实模式）；行带 `debug_se
   - `Middle`：**同一 label 的中间省略**——两头保留、中间 `…`（头部约占保留量 2/3），
     随宽度收缩两头同步变短，极窄只剩 `…`；自绘 `MiddleLabel` 元素按实测宽度截断
 
-状态：🔄 app 侧栏使用中（选中/展开/双击连接/右键菜单/新增/删除/重命名入口/拖拽迁移自旧树）。
-⏳ 待验证清单（后期按此逐条验证）：
+状态：✅ app 侧栏使用中（选中/展开/双击连接/右键菜单/新增/删除/重命名入口/拖拽迁移自旧树）。
+验证清单（2026-10-16 全部通过）：
 
 | # | 验证点 | 操作步骤 | 预期结果 |
 |---|--------|---------|---------|
@@ -217,6 +221,5 @@ droppable 分组高亮、内嵌 scroll_area（真实模式）；行带 `debug_se
 
 ## 预留 / 未实现（不在当前承诺内）
 
-- `set_node_icon`：节点图标选择器（app 侧图标 picker 模态，方案已定未做）
 - 拖拽排序的顺序语义（Move 目前排到目标末尾；`sort` 字段预留）
 - tree 虚拟滚动模式（当前真实滚动；超大节点数时再议）

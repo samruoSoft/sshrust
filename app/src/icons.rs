@@ -21,8 +21,8 @@ pub const ICON_CATEGORIES: &[(&str, &[&str])] = &[
     ("Connectivity", &["wifi", "network", "tv", "rss", "cast", "flag", "link", "blend", "cable", "radio", "share", "link-2", "signal", "antenna", "contact", "forward"]),
     ("Cursors", &["rat", "hand", "lasso", "pointer", "asterisk", "keyboard", "signpost", "touchpad", "pointer-off", "keyboard-off", "lasso-select", "touchpad-off", "mouse-pointer", "spline-pointer", "mouse-pointer-2"]),
     ("Design", &["layers", "package", "mic", "pen", "crop", "scan", "blend", "brush", "frame", "gavel", "lasso", "eraser", "shapes"]),
-    ("Coding & development", &["router", "server", "database", "terminal", "container", "hard-drive", "pi", "tv", "bug", "gpu", "code", "scan", "equal", "minus", "power", "regex"]),
-    ("Devices", &["cpu", "zap", "camera", "laptop", "router", "monitor", "printer", "activity", "hard-drive", "smartphone", "clapperboard", "tv", "eye", "gpu", "mic", "usb"]),
+    ("Coding & development", &["router", "server", "database", "terminal", "container", "hard-drive", "pi", "tv", "bug", "gpu", "code", "scan", "equal", "minus", "power", "regex", "circuit-board"]),
+    ("Devices", &["cpu", "zap", "camera", "laptop", "router", "monitor", "printer", "activity", "hard-drive", "smartphone", "clapperboard", "tv", "eye", "gpu", "mic", "usb", "circuit-board"]),
     ("Emoji", &["usb", "cable", "heart", "sticker", "webhook", "grid-2x2", "grid-3x2", "hdmi-port", "heart-off", "land-plot", "scan-face", "thumbs-up", "book-heart", "grid-2x2-x"]),
     ("File icons", &["folder", "package", "book-open", "file-text", "folder-open", "book", "file", "files", "file-x", "scroll", "upload", "archive", "file-up", "folders", "bookmark"]),
     ("Finance", &["nfc", "euro", "coins", "vault", "wallet", "bitcoin", "percent", "receipt", "banknote", "currency", "landmark", "badge-cent", "badge-euro", "banknote-x", "hand-coins", "piggy-bank"]),
@@ -71,6 +71,10 @@ pub const ROWS: &str = "rows-3";
 pub const INFO: &str = "info";
 /// 进程详情区外部搜索按钮。
 pub const SEARCH: &str = "search";
+/// 传输区下载方向。
+pub const DOWNLOAD: &str = "download";
+/// 传输完成标记。
+pub const CHECK: &str = "check";
 
 /// 按节点名称猜测图标（中英文关键词，先命中先用）。
 /// 空名/无命中回落到 fallback。
@@ -95,6 +99,13 @@ pub fn icon_for_name(name: &str, fallback: &str) -> String {
         ("轻量", "server"),
         ("server", "server"),
         ("host", "server"),
+        // 硬件 / 板卡
+        ("电路板", "circuit-board"),
+        ("电路", "circuit-board"),
+        ("板卡", "circuit-board"),
+        ("主板", "circuit-board"),
+        ("circuit", "circuit-board"),
+        ("mainboard", "circuit-board"),
         // 数据库
         ("数据库", "database"),
         ("mysql", "database"),

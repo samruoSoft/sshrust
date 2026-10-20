@@ -1,9 +1,12 @@
 [workspace]
 resolver = "2"
+# agent 不随仓库开源（闭源组件，成品经 GitHub Release 二进制分发）；
+# 本地目录保留并可独立构建：cargo build --manifest-path agent/Cargo.toml
 members = ["core", "spike", "app", "ui-kit", "third_party/gpui-terminal"]
+exclude = ["agent"]
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
 anyhow = "1"
 thiserror = "2"
 bytes = "1"
@@ -14,6 +17,15 @@ debug = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# agent 部署专用最小体积档（不影响 release：app 保留符号便于崩溃报告定位）。
+# 用法：cargo build --profile release-min --target aarch64-unknown-linux-musl -p sshrust-agent
+[profile.release-min]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = true
 
 [patch.crates-io]
 gpui-terminal = { path = "third_party/gpui-terminal" }

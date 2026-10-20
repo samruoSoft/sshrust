@@ -37,6 +37,8 @@ use ui_kit::pro::tree::{EllipsisMode, TreeEvent, TreeNodeData};
 
 const SETTING_SHORTCUT_H: &str = "sidebar.shortcut_h";
 const SETTING_EXPANDED: &str = "sidebar.expanded";
+/// 树工具栏高度（钉在标题区与树之间）。
+const TREE_TOOLBAR_H: f32 = 26.0;
 
 // —— kit 树 id 约定（与 db 正数 id 空间隔离；事件回程映射用） ——
 pub(crate) const KIT_HEADER_SERVERS: usize = 900_000_001;
@@ -55,7 +57,7 @@ pub enum SelectKey {
 }
 
 /// 菜单弹出目标，决定菜单项集合。
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum MenuTarget {
     /// 工具栏「＋」的通用新增。
     New,
@@ -68,6 +70,12 @@ pub enum MenuTarget {
     Node(i64),
     /// 标签页（弹出独立窗口入口）。
     Tab(u64),
+    /// 目录树·文件节点（参数 = 远端绝对路径）。
+    DirFile(String),
+    /// 目录树·目录节点（参数 = 远端绝对路径）。
+    DirDir(String),
+    /// 目录树空白处（参数 = 当前 cwd）。
+    DirBlank(String),
 }
 
 pub struct ContextMenu {
@@ -75,7 +83,7 @@ pub struct ContextMenu {
     pub target: MenuTarget,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum MenuAction {
     NewServer(i64),
     NewFolder(i64),
@@ -92,6 +100,10 @@ enum MenuAction {
     Delete(i64),
     OpenDataDir,
     PopTab(u64),
+    /// 目录树·下载远端文件（参数 = 远端绝对路径）。
+    DirDownload(String),
+    /// 目录树·上传本地文件到远端目录（参数 = 远端目录绝对路径）。
+    DirUpload(String),
 }
 
 /// 拖拽标记：gpui 的 on_drag_move 按标记类型过滤，同一类型的多条拖拽会互相触发，
@@ -194,10 +206,29 @@ fn to_kit_node(db: &Db, node: &TreeNode, pal: &Palette, is_live: &dyn Fn(&str, u
                 node.icon.clone()
             };
             l.icon = Some(icons::asset_path(&icon_name).into());
-            l.suffix = Some(format!("{}:{}", data.host, data.port));
+            // 行尾（简洁模式）与第二行（详细模式）同源：IP=host:port；P2P=NodeID。
+            let addr = match data.mode {
+                crate::db::ConnectMode::Ip => format!("{}:{}", data.host, data.port),
+                crate::db::ConnectMode::Iroh => data.host.clone(),
+            };
+            l.suffix = Some(addr.clone());
             // IP:端口 一头一尾都有信息量 → 溢出时两头保留、中间省略。
             l.suffix_ellipsis = EllipsisMode::Middle;
-            l.dot = Some(if is_live(&data.host, data.port) { pal.ok } else { pal.dim });
+            // 详细模式：第二行地址 + 第一行配置徽章（登录后从系统信息捕获）。
+            l.subtitle = Some(addr);
+            if !data.spec.is_empty() {
+                l.badge = Some(data.spec.clone());
+            }
+            // 已连接 = 激活行：状态点转绿 + 图标染绿 + 行底铺浅绿色调
+            // （bg 经 kit surface() 叠加表面透明度；模糊模式下表面还会整体压暗，
+            // 比例取 30% 保证暗色系一眼可辨——亮色系同为浅绿不刺眼）。
+            if is_live(&data.host, data.port) {
+                l.dot = Some(pal.ok);
+                l.colors.icon = Some(pal.ok);
+                l.colors.bg = Some(mix_rgb(pal.panel, pal.ok, 0.30));
+            } else {
+                l.dot = Some(pal.dim);
+            }
             l
         }
         NodeKind::Command(data) => {
@@ -274,6 +305,9 @@ impl crate::app_ui::AppUi {
             MenuAction::EditServer(id) => self.edit_server(id, cx),
             MenuAction::Delete(id) => self.delete_node(id, window, cx),
             MenuAction::OpenDataDir => open_data_dir(),
+            // 目录树传输入口（会话取激活 Live tab；无会话时入队即报错显示在传输行）。
+            MenuAction::DirDownload(path) => self.start_download(&path, cx),
+            MenuAction::DirUpload(dir) => self.start_upload(&dir, cx),
         }
         cx.notify();
     }
@@ -349,6 +383,118 @@ impl crate::app_ui::AppUi {
         }
     }
 
+    // ----- 树工具栏：简洁/详细（行模式）+ 全部展开/收缩 -----
+
+    /// settings 键：树行模式（"1" = 详细两行）。
+    const SETTING_TREE_DETAIL: &'static str = "sidebar.tree.detail";
+
+    fn set_tree_detail(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.tree_detail = on;
+        self.db.set_setting(Self::SETTING_TREE_DETAIL, if on { "1" } else { "0" });
+        self.tree.update(cx, |t, cx| t.set_detail(on, cx));
+        cx.notify();
+    }
+
+    fn tree_expand_all(&mut self, cx: &mut Context<Self>) {
+        self.tree.update(cx, |t, cx| t.expand_all(cx));
+        self.persist_expanded(cx);
+        cx.notify();
+    }
+
+    fn tree_collapse_all(&mut self, cx: &mut Context<Self>) {
+        self.tree.update(cx, |t, cx| t.collapse_all(cx));
+        self.persist_expanded(cx);
+        cx.notify();
+    }
+
+    /// 树上方工具栏：简洁/详细（选中态互斥）+ 全部展开/收缩。
+    fn render_tree_toolbar(&self, cx: &Context<Self>) -> AnyElement {
+        let pal = self.theme();
+        let loc = self.loc;
+        let t = |k: crate::i18n::Tr| crate::i18n::tl(loc, k);
+        // 图标必须显式传色（gpui svg 不吃父级 text_color）。
+        let chip = |id: &'static str,
+                    icon: &str,
+                    label: &str,
+                    active: bool,
+                    cx: &Context<Self>,
+                    f: fn(&mut Self, &mut Context<Self>)| {
+            let fg = if active { pal.accent_dark } else { pal.muted };
+            div()
+                .id(id)
+                .h(px(18.))
+                .px(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(3.))
+                .flex_none()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(10.5))
+                .bg(if active { rgb(pal.accent) } else { pal.surface(pal.card) })
+                .text_color(rgb(fg))
+                .hover(|s| s.bg(rgb(pal.border)))
+                .child(
+                    gpui::svg()
+                        .path(icons::asset_path(icon))
+                        .size(px(11.))
+                        .flex_none()
+                        .text_color(rgb(fg)),
+                )
+                .child(label.to_string())
+                .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| f(this, cx)))
+                .into_any_element()
+        };
+        div()
+            .id("sidebar-tree-toolbar")
+            .absolute()
+            .top(px(TITLEBAR_H))
+            .left_0()
+            .w_full()
+            .h(px(TREE_TOOLBAR_H))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .bg(pal.surface(pal.panel))
+            .border_b_1()
+            .border_color(rgb(pal.divider()))
+            .child(chip(
+                "tree-mode-compact",
+                "rows-2",
+                t(crate::i18n::Tr::TreeCompact),
+                !self.tree_detail,
+                cx,
+                |this, cx| this.set_tree_detail(false, cx),
+            ))
+            .child(chip(
+                "tree-mode-detail",
+                "rows-4",
+                t(crate::i18n::Tr::TreeDetail),
+                self.tree_detail,
+                cx,
+                |this, cx| this.set_tree_detail(true, cx),
+            ))
+            .child(div().flex_1())
+            .child(chip(
+                "tree-expand-all",
+                "plus",
+                t(crate::i18n::Tr::TreeExpandAll),
+                false,
+                cx,
+                |this, cx| this.tree_expand_all(cx),
+            ))
+            .child(chip(
+                "tree-collapse-all",
+                "minus",
+                t(crate::i18n::Tr::TreeCollapseAll),
+                false,
+                cx,
+                |this, cx| this.tree_collapse_all(cx),
+            ))
+            .into_any_element()
+    }
+
     // ----- 节点 CRUD 入口 -----
 
     /// 新建节点：落库、刷树、进入组件内联重命名。
@@ -406,7 +552,7 @@ impl crate::app_ui::AppUi {
         } else {
             node.icon.clone()
         };
-        match server_params(&data) {
+        match server_params(&self.db, &data) {
             Some(params) => self.open_connecting_tab(title, params, Some(icon), cx),
             None => {
                 // 缺口令/密钥：打开表单窗口补齐（编辑态，保存即更新该节点）。
@@ -549,12 +695,14 @@ impl crate::app_ui::AppUi {
                             })),
                     ),
             )
+            // 树工具栏：简洁/详细 + 展开/收缩（钉在标题区下）
+            .child(self.render_tree_toolbar(cx))
             // 树：kit TreeState 组件（自带滚动/重命名/拖拽）
             .child(
                 div()
                     .id("sidebar-tree")
                     .absolute()
-                    .top(px(TITLEBAR_H))
+                    .top(px(TITLEBAR_H + TREE_TOOLBAR_H))
                     .bottom(px(inset_bottom + SIDEBAR_SPLITTER_H))
                     .left_0()
                     .w_full()
@@ -699,10 +847,20 @@ impl crate::app_ui::AppUi {
             .left_0()
             .h(px(SIDEBAR_TOOLBAR_H))
             .w_full()
+            .flex()
+            .items_center()
+            .px_2()
             .bg(pal.surface(pal.bg))
             .border_t_1()
             .border_color(rgb(pal.divider()))
             .occlude()
+            // 左下角常驻版本号（关于对话框之外的日常可见位）。
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(rgb(pal.dim))
+                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
+            )
             .into_any_element()
     }
 
@@ -814,14 +972,42 @@ impl crate::app_ui::AppUi {
                 ],
                 None => vec![],
             },
+            // 目录树传输入口：文件 → 下载；目录/空白 → 上传到该目录。
+            MenuTarget::DirFile(_) => vec![iitem(
+                "download",
+                tr(crate::i18n::Tr::MenuDownload),
+                MenuAction::DirDownload(match target {
+                    MenuTarget::DirFile(p) => p.clone(),
+                    _ => unreachable!(),
+                }),
+            )],
+            MenuTarget::DirDir(_) | MenuTarget::DirBlank(_) => vec![iitem(
+                "upload",
+                tr(crate::i18n::Tr::MenuUploadHere),
+                MenuAction::DirUpload(match target {
+                    MenuTarget::DirDir(p) | MenuTarget::DirBlank(p) => p.clone(),
+                    _ => unreachable!(),
+                }),
+            )],
         }
     }
 }
 
 // ---------- 辅助 ----------
 
+/// 两色线性插值（0xRRGGBB；t=0 → a，t=1 → b）。激活行底色调用。
+fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |x: u32, s: u32| ((x >> s) & 0xff) as f32;
+    let mix_ch = |s: u32| {
+        let v = ch(a, s) + (ch(b, s) - ch(a, s)) * t;
+        (v.round() as u32).min(0xff) << s
+    };
+    mix_ch(16) | mix_ch(8) | mix_ch(0)
+}
+
 /// 服务器数据 → 连接参数；口令/密钥缺失时返回 None 由调用方处理。
-pub(crate) fn server_params(data: &ServerData) -> Option<ConnectParams> {
+/// iroh 模式的 relay/令牌取全局设置（设置 › 通用 › 网络）。
+pub(crate) fn server_params(db: &crate::db::Db, data: &ServerData) -> Option<ConnectParams> {
     let auth = match &data.auth {
         StoredAuth::Password(Some(pw)) => AuthMethod::Password(pw.clone()),
         StoredAuth::Password(None) => return None,
@@ -830,6 +1016,13 @@ pub(crate) fn server_params(data: &ServerData) -> Option<ConnectParams> {
             passphrase: passphrase.clone(),
         },
     };
+    let transport = match data.mode {
+        crate::db::ConnectMode::Ip => sshrust_core::Transport::Tcp,
+        crate::db::ConnectMode::Iroh => {
+            let (relay, token) = crate::db::iroh_global(db);
+            sshrust_core::Transport::Iroh { relay, token }
+        }
+    };
     Some(ConnectParams {
         host: data.host.clone(),
         port: data.port,
@@ -837,6 +1030,7 @@ pub(crate) fn server_params(data: &ServerData) -> Option<ConnectParams> {
         auth,
         cols: 100,
         rows: 30,
+        transport,
     })
 }
 
@@ -858,6 +1052,14 @@ mod tests {
         assert!(matches!(menu_target_for(Some(3)), MenuTarget::Node(3)));
         assert!(matches!(menu_target_for(Some(KIT_GROUP_SERVERS)), MenuTarget::GroupServers));
         assert!(matches!(menu_target_for(None), MenuTarget::New));
+    }
+
+    #[test]
+    fn mix_rgb_interpolates() {
+        assert_eq!(mix_rgb(0x1a1b26, 0x1a1b26, 0.13), 0x1a1b26, "同色混合不变");
+        assert_eq!(mix_rgb(0x000000, 0xffffff, 0.), 0x000000);
+        assert_eq!(mix_rgb(0x000000, 0xffffff, 1.), 0xffffff);
+        assert_eq!(mix_rgb(0x101010, 0xf0f0f0, 0.5), 0x808080, "中点取半");
     }
 }
 
@@ -892,7 +1094,7 @@ mod flow_tests {
             let folder = u.db.insert(NewNode { parent: ROOT_SERVERS, kind: NodeKind::Folder, name: "TF".into() });
             let server = u.db.insert(NewNode {
                 parent: folder.id,
-                kind: NodeKind::Server(ServerData { host: "1.2.3.4".into(), port: 22, username: "u".into(), auth: StoredAuth::Password(None) }),
+                kind: NodeKind::Server(ServerData { host: "1.2.3.4".into(), port: 22, username: "u".into(), auth: StoredAuth::Password(None), mode: crate::db::ConnectMode::Ip, iroh_relay: String::new(), iroh_token: String::new(), spec: String::new() }),
                 name: "TS".into(),
             });
             (folder.id, server.id)
@@ -927,7 +1129,7 @@ mod flow_tests {
                 let folder = u.db.insert(NewNode { parent: ROOT_SERVERS, kind: NodeKind::Folder, name: "TF".into() });
                 u.db.insert(NewNode {
                     parent: folder.id,
-                    kind: NodeKind::Server(ServerData { host: "1.2.3.4".into(), port: 22, username: "u".into(), auth: StoredAuth::Password(None) }),
+                    kind: NodeKind::Server(ServerData { host: "1.2.3.4".into(), port: 22, username: "u".into(), auth: StoredAuth::Password(None), mode: crate::db::ConnectMode::Ip, iroh_relay: String::new(), iroh_token: String::new(), spec: String::new() }),
                     name: "TS".into(),
                 });
                 u.refresh_tree(cx);
@@ -1015,7 +1217,7 @@ mod flow_tests {
             ui.update(app, |u, _| {
                 u.db.insert(NewNode {
                     parent: ROOT_SERVERS,
-                    kind: NodeKind::Server(ServerData { host: "1.2.3.4".into(), port: 22, username: "u".into(), auth: StoredAuth::Password(None) }),
+                    kind: NodeKind::Server(ServerData { host: "1.2.3.4".into(), port: 22, username: "u".into(), auth: StoredAuth::Password(None), mode: crate::db::ConnectMode::Ip, iroh_relay: String::new(), iroh_token: String::new(), spec: String::new() }),
                     name: "TS".into(),
                 })
                 .id

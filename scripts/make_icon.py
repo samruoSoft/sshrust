@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """生成 SSHRust 应用图标母版（1024×1024 PNG）。
 
-深空渐变 squircle 背景（对应 app 默认 Tokyo-Night 深色系）+ 白色终端提示符 ">_"。
+设计（2026-10-20 定稿：机器人吉祥物）：
+- 深空渐变 squircle 背景（对应 app 默认 Tokyo-Night 深色系）
+- 居中机器人吉祥物（用户选定原图白底抠除，scripts/icon-robot.png）
+- 底部软阴影增加落感
+
 被 scripts/package.sh 调用；也可独立运行：make_icon.py [输出路径]。
 """
+import pathlib
 import sys
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 S = 1024
 OUT = sys.argv[1] if len(sys.argv) > 1 else "target/iconset/master.png"
@@ -38,20 +43,21 @@ def main() -> None:
         [pad, pad, S - pad, S - pad], radius=radius, outline=(255, 255, 255, 28), width=3
     )
 
-    # 终端提示符 ">_"（白，圆头线，几何贴近 lucide terminal）
-    fg = (235, 239, 255, 255)
-    lw = 66
-
-    def line(p1: tuple[int, int], p2: tuple[int, int]) -> None:
-        d.line([p1, p2], fill=fg, width=lw)
-        r0 = lw // 2
-        for (x, y) in (p1, p2):
-            d.ellipse([x - r0, y - r0, x + r0, y + r0], fill=fg)
-
-    cx, cy = S // 2, S // 2
-    line((cx - 200, cy - 170), (cx - 40, cy))
-    line((cx - 40, cy), (cx - 200, cy + 170))
-    line((cx + 40, cy + 170), (cx + 260, cy + 170))
+    # —— 机器人吉祥物（scripts/icon-robot.png：白底原图已抠底）——
+    robot = Image.open(pathlib.Path(__file__).with_name("icon-robot.png")).convert('RGBA')
+    # 目标高 ≈ 画布 68%，等比缩放
+    target_h = 700
+    scale = target_h / robot.height
+    robot = robot.resize((int(robot.width * scale), target_h), Image.LANCZOS)
+    # 底部软阴影（黑色椭圆模糊，增加落感）
+    shadow = Image.new('RGBA', (S, S), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sw = int(robot.width * 0.46)
+    sd.ellipse([512 - sw, 812 - 44, 512 + sw, 812 + 44], fill=(0, 0, 0, 110))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(22))
+    img.alpha_composite(shadow)
+    # 居中贴入（视觉重心略上提 6px）
+    img.alpha_composite(robot, (512 - robot.width // 2, 512 - robot.height // 2 - 6))
 
     img.save(OUT)
     print(OUT)

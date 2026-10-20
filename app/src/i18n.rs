@@ -120,21 +120,97 @@ pub enum Tr {
     DeleteConfirmTitle,
     /// 「正在连接 {0} …」
     ConnectingTo,
-    /// 连接视图副标题（协议流程；技术词保留英文）。
-    ConnectingSteps,
     /// 「{0} 连接失败」
     ConnFailed,
     Reconnect,
+
+    // ---- 连接过程日志（步骤行文案；{0} = 目标/方式，来自 ConnectParams） ----
+    /// 「TCP 连接 {0}」
+    StepTcp,
+    StepIrohEndpoint,
+    StepIrohOnline,
+    /// 「拨号对端 {0}」
+    StepIrohConnect,
+    StepIrohStream,
+    StepSshHandshake,
+    /// 「认证（{0}）」，参数 = 密码/密钥。
+    StepSshAuth,
+    StepSshChannel,
+    StepSshPty,
+    StepDone,
+
+    // ---- P2P 网络情况（会话状态页 / 状态栏） ----
+    /// 链路方式标签。
+    NetPath,
+    /// 直连（打洞成功）。
+    NetDirect,
+    /// 中继（经 relay 转发）。
+    NetRelay,
+    /// 混合（直连 + 中继并行）。
+    NetMixed,
+    /// 本端网络。
+    NetLocal,
+    /// 对端网络。
+    NetRemote,
+    /// 网络探测中。
+    NetDetecting,
+    /// 网络信息获取失败。
+    NetDetectFail,
+    /// 未知/无数据。
+    NetUnknown,
+    /// tooltip：直连说明。
+    NetTipDirect,
+    /// tooltip：中继说明。
+    NetTipRelay,
+    /// tooltip：混合说明。
+    NetTipMixed,
+    /// 会话往返延迟标签。
+    NetRtt,
+
+    // ---- 服务器树：工具栏 / 空态 ----
+    /// 树工具栏·简洁（单行）。
+    TreeCompact,
+    /// 树工具栏·详细（两行）。
+    TreeDetail,
+    /// 树工具栏·全部展开。
+    TreeExpandAll,
+    /// 树工具栏·全部收缩。
+    TreeCollapseAll,
+    /// 全部 tab 关闭后的空态提示。
+    EmptyTabsHint,
+
     /// 右侧目录面板标题（「目录 · 服务器名」的前半）。
     DirTitle,
     /// 右面板·会话状态页标题。
     SessionStatus,
     /// 会话状态页空态（无任何会话行）。
     SessionEmptyHint,
-    /// 目录面板内传输区标题（传输功能后续开发）。
+    /// 目录面板内传输区标题。
     TransferTitle,
     /// 传输区空态。
     TransferNoTasks,
+    /// 传输排队中。
+    TransferQueued,
+    /// 传输完成。
+    TransferDone,
+    /// 传输已取消。
+    TransferCanceled,
+    /// 传输失败（前缀，详情拼在后）。
+    TransferFailed,
+    /// 传输区「清空已完成」按钮。
+    TransferClearFinished,
+    /// 传输区上传按钮 tooltip（上传到当前目录）。
+    TipUploadHere,
+    /// 目录树右键·上传文件到该目录。
+    MenuUploadHere,
+    /// 目录树右键·下载该文件。
+    MenuDownload,
+    /// 上传覆盖确认标题。
+    OverwriteConfirmTitle,
+    /// 上传覆盖确认正文（{0} = 冲突文件数）。
+    OverwriteConfirmBody,
+    /// 上传覆盖确认·确认按钮。
+    OverwriteConfirmOk,
     /// 目录面板空态提示（无已连接会话时）。
     DirEmptyHint,
     /// 目录面板已连接但 cwd 未知（等 OSC 7 / pwd）。
@@ -323,7 +399,15 @@ pub enum Tr {
     ErrUserEmpty,
     ErrKeyMissing,
     LabelAlias,
+    LabelConnMode,
+    ConnModeIp,
+    ConnModeIroh,
     LabelHost,
+    LabelNodeId,
+    LabelRelay,
+    LabelRelayToken,
+    IrohFormHint,
+    ErrNodeId,
     LabelPort,
     LabelUsername,
     LabelAuth,
@@ -344,6 +428,12 @@ pub enum Tr {
     NavGeneral,
     /// 「通用」分组条目：系统（详情页含 语言/窗口/界面主题）。
     NavSystem,
+    /// 「通用」分组条目：网络（P2P 中继全局配置）。
+    NavNetwork,
+    /// 网络页「P2P 中继」节标题。
+    SecP2pRelay,
+    /// 网络页 relay/令牌说明（留空 = n0 公共设施）。
+    NetSettingsHint,
     /// 系统页「窗口」节标题。
     SecWindow,
     SecBgBlur,
@@ -383,6 +473,20 @@ pub enum Tr {
     /// 「当前语言：{0}」
     LangCurrent,
     PhTplName,
+
+    // ---- 应用菜单（原生菜单栏） / 关于窗口 ----
+    /// 应用菜单「关于 SSHRust」（兼关于窗口标题）。
+    MenuAbout,
+    /// 应用菜单「设置…」（兼 ⌘, 快捷键）。
+    MenuSettings,
+    /// 应用菜单「退出 SSHRust」。
+    MenuQuit,
+    /// 关于窗口：一句话简介。
+    AboutTagline,
+    /// 关于窗口：版本行前缀（「版本 0.1.0」）。
+    AboutVersion,
+    /// 关于窗口：GitHub 主页链接文字。
+    AboutHomepage,
 
     // ---- 弹出独立窗口 ----
     MergeBack,
@@ -501,14 +605,68 @@ impl Tr {
             ),
             Tr::DeleteConfirmTitle => m!(loc, "删除「{0}」？", "Delete \"{0}\"?"),
             Tr::ConnectingTo => m!(loc, "正在连接 {0} …", "Connecting to {0} …"),
-            Tr::ConnectingSteps => m!(loc, "russh：握手 → 认证 → PTY → Shell", "russh: handshake → auth → pty → shell"),
             Tr::ConnFailed => m!(loc, "{0} 连接失败", "Failed to connect to {0}"),
             Tr::Reconnect => m!(loc, "重连", "Reconnect"),
+            Tr::StepTcp => m!(loc, "TCP 连接 {0}", "TCP connect {0}"),
+            Tr::StepIrohEndpoint => m!(loc, "启动 iroh 端点（relay 配置）", "Starting iroh endpoint (relay config)"),
+            Tr::StepIrohOnline => m!(loc, "等待网络就绪（relay 汇合）", "Waiting for network (relay rendezvous)"),
+            Tr::StepIrohConnect => m!(loc, "拨号对端 {0}", "Dialing peer {0}"),
+            Tr::StepIrohStream => m!(loc, "打开 QUIC 流", "Opening QUIC stream"),
+            Tr::StepSshHandshake => m!(loc, "SSH 握手（版本交换 / 密钥协商）", "SSH handshake (version / key exchange)"),
+            Tr::StepSshAuth => m!(loc, "认证（{0}）", "Authenticating ({0})"),
+            Tr::StepSshChannel => m!(loc, "打开会话通道", "Opening session channel"),
+            Tr::StepSshPty => m!(loc, "请求 PTY 与 Shell", "Requesting PTY & shell"),
+            Tr::StepDone => m!(loc, "连接已建立", "Connection established"),
+            Tr::NetPath => m!(loc, "链路", "Path"),
+            Tr::NetDirect => m!(loc, "直连", "Direct"),
+            Tr::NetRelay => m!(loc, "中继", "Relay"),
+            Tr::NetMixed => m!(loc, "混合", "Mixed"),
+            Tr::NetLocal => m!(loc, "本端", "Local"),
+            Tr::NetRemote => m!(loc, "对端", "Remote"),
+            Tr::NetDetecting => m!(loc, "网络检测中…", "Detecting network…"),
+            Tr::NetDetectFail => m!(loc, "获取失败", "Unavailable"),
+            Tr::NetUnknown => m!(loc, "未知", "Unknown"),
+            Tr::NetTipDirect => m!(
+                loc,
+                "直连：两端 UDP 打洞点对点直连，不经中继，延迟最低。",
+                "Direct: the two endpoints hole-punched a direct UDP path, no relay, lowest latency."
+            ),
+            Tr::NetTipRelay => m!(
+                loc,
+                "中继：经 relay 服务器加密转发（打洞未成或网络限制 UDP 时），始终端到端加密，延迟较高。",
+                "Relay: traffic encrypted and forwarded via a relay server (hole punching unavailable or UDP restricted); still end-to-end encrypted, higher latency."
+            ),
+            Tr::NetTipMixed => m!(
+                loc,
+                "混合：直连已打通，中继保留作热备（QUIC 多路径）；流量主走直连，直连中断可无缝切中继。",
+                "Mixed: direct path established with the relay kept as hot standby (QUIC multipath); traffic rides the direct path and fails over to the relay seamlessly."
+            ),
+            Tr::NetRtt => m!(loc, "延迟", "Latency"),
+            Tr::TreeCompact => m!(loc, "简洁", "List"),
+            Tr::TreeDetail => m!(loc, "详细", "Detail"),
+            Tr::TreeExpandAll => m!(loc, "全部展开", "Expand All"),
+            Tr::TreeCollapseAll => m!(loc, "全部收缩", "Collapse All"),
+            Tr::EmptyTabsHint => m!(loc, "⌘T 新建连接", "⌘T New Connection"),
             Tr::DirTitle => m!(loc, "目录", "Directory"),
             Tr::SessionStatus => m!(loc, "会话状态", "Session Status"),
             Tr::SessionEmptyHint => m!(loc, "暂无会话", "No sessions"),
             Tr::TransferTitle => m!(loc, "文件传输", "File Transfer"),
             Tr::TransferNoTasks => m!(loc, "暂无传输任务", "No transfers"),
+            Tr::TransferQueued => m!(loc, "排队中", "Queued"),
+            Tr::TransferDone => m!(loc, "已完成", "Done"),
+            Tr::TransferCanceled => m!(loc, "已取消", "Canceled"),
+            Tr::TransferFailed => m!(loc, "失败", "Failed"),
+            Tr::TransferClearFinished => m!(loc, "清空已完成", "Clear finished"),
+            Tr::TipUploadHere => m!(loc, "上传文件到当前目录", "Upload files to current directory"),
+            Tr::MenuUploadHere => m!(loc, "上传文件到此处…", "Upload files here…"),
+            Tr::MenuDownload => m!(loc, "下载…", "Download…"),
+            Tr::OverwriteConfirmTitle => m!(loc, "覆盖确认", "Overwrite Files"),
+            Tr::OverwriteConfirmBody => m!(
+                loc,
+                "目标目录已有 {0} 个同名文件，继续上传将覆盖它们。",
+                "{0} file(s) with the same name already exist in the target directory. Uploading will overwrite them."
+            ),
+            Tr::OverwriteConfirmOk => m!(loc, "覆盖上传", "Overwrite"),
             Tr::DirEmptyHint => m!(
                 loc,
                 "连接服务器后在此浏览其目录",
@@ -698,6 +856,18 @@ impl Tr {
                 "Paste a private key (PEM / OpenSSH format) for key auth"
             ),
             Tr::LabelAlias => m!(loc, "别名", "Alias"),
+            Tr::LabelConnMode => m!(loc, "连接方式", "Connection"),
+            Tr::ConnModeIp => m!(loc, "IP 直连", "IP"),
+            Tr::ConnModeIroh => m!(loc, "P2P", "P2P"),
+            Tr::LabelNodeId => m!(loc, "NodeID", "NodeID"),
+            Tr::LabelRelay => m!(loc, "Relay", "Relay"),
+            Tr::LabelRelayToken => m!(loc, "令牌", "Token"),
+            Tr::IrohFormHint => m!(
+                loc,
+                "目标设备需运行 sshrust-agent；Relay/令牌在「设置 › 通用 › 网络」全局配置",
+                "Target device must run sshrust-agent; relay & token are configured in Settings › General › Network"
+            ),
+            Tr::ErrNodeId => m!(loc, "NodeID 应为 64 位十六进制字符", "NodeID must be 64 hex characters"),
             Tr::LabelHost => m!(loc, "主机", "Host"),
             Tr::LabelPort => m!(loc, "端口", "Port"),
             Tr::LabelUsername => m!(loc, "用户名", "Username"),
@@ -716,6 +886,13 @@ impl Tr {
             Tr::NavConsole => m!(loc, "控制台", "Console"),
             Tr::NavGeneral => m!(loc, "通用", "General"),
             Tr::NavSystem => m!(loc, "系统", "System"),
+            Tr::NavNetwork => m!(loc, "网络", "Network"),
+            Tr::SecP2pRelay => m!(loc, "P2P 中继（iroh）", "P2P Relay (iroh)"),
+            Tr::NetSettingsHint => m!(
+                loc,
+                "P2P 连接全局生效：自建 relay 填 URL（可带令牌）；留空使用 n0 公共设施。",
+                "Applies to all P2P connections: set a self-hosted relay URL (token optional); leave empty to use the public n0 infrastructure."
+            ),
             Tr::SecWindow => m!(loc, "窗口", "Window"),
             Tr::SecBgBlur => m!(loc, "背景模糊", "Background Blur"),
             Tr::SecSearchEngine => m!(loc, "搜索引擎", "Search Engine"),
@@ -753,6 +930,17 @@ impl Tr {
             Tr::LangEn => m!(loc, "English", "English"),
             Tr::LangCurrent => m!(loc, "当前语言：{0}", "Current language: {0}"),
             Tr::PhTplName => m!(loc, "模板名", "Template name"),
+
+            Tr::MenuAbout => m!(loc, "关于 SSHRust", "About SSHRust"),
+            Tr::MenuSettings => m!(loc, "设置…", "Settings…"),
+            Tr::MenuQuit => m!(loc, "退出 SSHRust", "Quit SSHRust"),
+            Tr::AboutTagline => m!(
+                loc,
+                "Rust + GPUI 打造的原生 SSH 客户端",
+                "A native SSH client built with Rust + GPUI"
+            ),
+            Tr::AboutVersion => m!(loc, "版本", "Version"),
+            Tr::AboutHomepage => m!(loc, "项目主页", "Project Homepage"),
 
             Tr::MergeBack => m!(loc, "并入主窗口", "Merge to Main Window"),
             Tr::SessionEnded => m!(loc, "会话已结束", "Session ended"),

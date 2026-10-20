@@ -26,7 +26,7 @@
 //! │ ▾ .config      │ ← 树：箭头 + 图标 + 名称（+ 链接目标 → xx）
 //! │ ▸ bin   →usr/bin
 //! ├────────────────┤ ← 分割线（拖拽调两区高度）
-//! │ 文件传输        │ ← 传输区（功能后续开发，现空态提示）
+//! │ 文件传输    ⬆ ✕│ ← 传输区（SFTP 上传/下载列表，见 transfer.rs）
 //! └────────────────┘
 
 use std::collections::hash_map::DefaultHasher;
@@ -189,11 +189,11 @@ fn path_id(host_key: &str, path: &str) -> usize {
 /// 目录状态 → kit 树节点森林。目录=分组（黄文件夹），文件=叶子（灰），
 /// 隐藏项（点前缀）文字再弱一档，符号链接行尾「→ 目标」；
 /// 未缓存的目录（含根）在取数期间显示「…」占位。
-/// `paths` 回填 id → 路径映射（展开事件懒加载用）。
+/// `paths` 回填 id → (路径, 是否目录) 映射（展开懒加载/右键菜单用）。
 pub(crate) fn dir_forest(
     st: &DirTree,
     pal: &PalFx,
-    paths: &mut HashMap<usize, String>,
+    paths: &mut HashMap<usize, (String, bool)>,
 ) -> Vec<TreeNodeData> {
     let Some(root) = st.cwd.clone() else {
         return Vec::new();
@@ -216,15 +216,15 @@ fn build_level(
     st: &DirTree,
     dir_path: &str,
     pal: &PalFx,
-    paths: &mut HashMap<usize, String>,
+    paths: &mut HashMap<usize, (String, bool)>,
     out: &mut Vec<TreeNodeData>,
 ) {
-    paths.insert(path_id(&st.host_key, dir_path), dir_path.to_string());
+    paths.insert(path_id(&st.host_key, dir_path), (dir_path.to_string(), true));
     let Some(entries) = st.cache.get(dir_path) else { return };
     for e in entries {
         let child_path = format!("{}/{}", dir_path.trim_end_matches('/'), e.name);
         let id = path_id(&st.host_key, &child_path);
-        paths.insert(id, child_path.clone());
+        paths.insert(id, (child_path.clone(), e.dir));
         let hidden = e.name.starts_with('.');
         let mut node = if e.dir {
             let mut g = TreeNodeData::group(id, e.name.clone());
@@ -237,7 +237,7 @@ fn build_level(
             }
             g.icon = Some(icons::asset_path(icons::FOLDER).into());
             g.icon_open = Some(icons::asset_path(icons::FOLDER_OPEN).into());
-            // 目录操作（上传/下载等）后续接线，先不做拖放目标。
+            // 传输不走拖放（右键菜单 + 传输区按钮入口）。
             g.droppable = false;
             g
         } else {
@@ -439,18 +439,39 @@ impl crate::app_ui::AppUi {
         .detach();
     }
 
-    /// 目录树事件：展开未缓存目录 → 懒加载取清单（其余事件后续接线）。
+    /// 目录树事件：展开未缓存目录 → 懒加载取清单；右键 → 传输菜单（下载/上传）。
     pub(crate) fn on_dir_tree_event(&mut self, ev: &TreeEvent, cx: &mut Context<Self>) {
-        if let TreeEvent::Toggle { id, expanded: true } = ev {
-            let Some(tab_id) = self.active_live_tab().map(|t| t.id) else { return };
-            let Some(path) = self.dir_paths.get(id).cloned() else { return };
-            let cached = self
-                .dir_data
-                .get(&tab_id)
-                .is_some_and(|st| st.cache.contains_key(&path));
-            if !cached {
-                self.dir_fetch(tab_id, path, cx);
+        match ev {
+            TreeEvent::Toggle { id, expanded: true } => {
+                let Some(tab_id) = self.active_live_tab().map(|t| t.id) else { return };
+                let Some(path) = self.dir_paths.get(id).map(|(p, _)| p.clone()) else { return };
+                let cached = self
+                    .dir_data
+                    .get(&tab_id)
+                    .is_some_and(|st| st.cache.contains_key(&path));
+                if !cached {
+                    self.dir_fetch(tab_id, path, cx);
+                }
             }
+            TreeEvent::ContextMenu { id, position } => {
+                // 文件 → 下载；目录/空白 → 上传到该目录（空白 = 当前 cwd）。
+                let target = match id.and_then(|id| self.dir_paths.get(&id)) {
+                    Some((path, true)) => crate::sidebar::MenuTarget::DirDir(path.clone()),
+                    Some((path, false)) => crate::sidebar::MenuTarget::DirFile(path.clone()),
+                    None => {
+                        let cwd = self
+                            .active_live_tab()
+                            .and_then(|t| self.dir_data.get(&t.id))
+                            .and_then(|st| st.cwd.clone());
+                        match cwd {
+                            Some(cwd) => crate::sidebar::MenuTarget::DirBlank(cwd),
+                            None => return,
+                        }
+                    }
+                };
+                self.open_menu(target, *position, cx);
+            }
+            _ => {}
         }
     }
 
@@ -664,57 +685,9 @@ impl crate::app_ui::AppUi {
             .into_any_element()
     }
 
-    /// 传输区（钉底；标题行 + 空态提示——传输功能后续开发）。
-    pub(crate) fn render_dir_transfer(&self, transfer_h: f32, cx: &Context<Self>) -> AnyElement {
-        let pal = self.theme();
-        div()
-            .id("dir-transfer")
-            .absolute()
-            .bottom_0()
-            .left_0()
-            .right_0()
-            .h(px(transfer_h))
-            .flex_col()
-            .overflow_hidden()
-            .child(
-                div()
-                    .id("dir-transfer-head")
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .h(px(DIR_TITLE_H))
-                    .px_3()
-                    .flex_none()
-                    .text_size(px(11.))
-                    .text_color(rgb(pal.dim))
-                    .child(
-                        gpui::svg()
-                            .path(icons::asset_path(icons::UPLOAD))
-                            .size(px(12.))
-                            .flex_none()
-                            .mr_1()
-                            .text_color(rgb(pal.dim)),
-                    )
-                    .child(crate::i18n::t(cx, crate::i18n::Tr::TransferTitle)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .px_3()
-                            .text_size(px(11.))
-                            .text_color(rgb(pal.dim))
-                            .child(crate::i18n::t(cx, crate::i18n::Tr::TransferNoTasks)),
-                    ),
-            )
-            .into_any_element()
-    }
 }
 
+/// 传输区（钉底）渲染在 transfer.rs（render_dir_transfer）。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,10 +769,10 @@ lrwxrwxrwx  1 root root    7 Oct 14 08:00 bin -> usr/bin";
         assert_eq!(bashrc.colors.text, Some(pal().dim));
 
         // 路径映射：根 + 各子路径（占位节点不入映射）。
-        assert!(paths.values().any(|p| p == "/home/t"));
-        assert!(paths.values().any(|p| p == "/home/t/projects"));
-        assert!(paths.values().any(|p| p == "/home/t/latest"));
-        assert!(!paths.values().any(|p| p.contains('…')));
+        assert!(paths.values().any(|(p, _)| p == "/home/t"));
+        assert!(paths.values().any(|(p, _)| p == "/home/t/projects"));
+        assert!(paths.values().any(|(p, _)| p == "/home/t/latest"));
+        assert!(!paths.values().any(|(p, _)| p.contains('…')));
     }
 
     /// 根清单未到位时的占位：取数中显示「…」，既非取数中也无缓存则空

@@ -1,7 +1,7 @@
 //! 内嵌资产：树形图标（Lucide，ISC 许可）。
 //!
 //! 零依赖实现 gpui 的 AssetSource——用 include_str! 把 SVG 编进二进制，
-//! 314 个图标，不引入额外 crate、不显著增加体积。
+//! 317 个图标，不引入额外 crate、不显著增加体积。
 //! gpui 的 svg 渲染把图形转成 alpha mask 后按文本色着色，因此图标文件用纯黑描边。
 
 use std::borrow::Cow;
@@ -71,10 +71,12 @@ const ICONS: &[(&str, &str)] = &[
     icon!("cast"),
     icon!("castle"),
     icon!("cat"),
+    icon!("check"),
     icon!("chevron-left"),
     icon!("chevron-right"),
     icon!("cctv"),
     icon!("circle"),
+    icon!("circuit-board"),
     icon!("clapperboard"),
     icon!("clock"),
     icon!("cloud"),
@@ -101,6 +103,7 @@ const ICONS: &[(&str, &str)] = &[
     icon!("dices"),
     icon!("diff"),
     icon!("disc"),
+    icon!("download"),
     icon!("dna"),
     icon!("dna-off"),
     icon!("dock"),

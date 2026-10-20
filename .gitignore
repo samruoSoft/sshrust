@@ -10,3 +10,6 @@
 .vscode/
 .zcode/
 .zcodeignore
+
+# 闭源组件（不随仓库分发；成品二进制走 GitHub Release）
+/agent/

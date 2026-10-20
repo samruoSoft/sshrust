@@ -1,6 +1,7 @@
 //! sshrust GUI 入口：窗口/键位/全局运行时。
 //! 具体布局见 app_ui.rs（三栏 + 紧凑标题栏 + 多 Tab）。
 
+mod about;
 mod app_ui;
 mod assets;
 mod db;
@@ -12,12 +13,14 @@ mod hosts;
 mod i18n;
 mod icon_picker;
 mod icons;
+mod netinfo;
 mod popped;
 mod procs;
 mod settings_view;
 mod sidebar;
 mod sysinfo;
 mod theme;
+mod transfer;
 
 use std::sync::OnceLock;
 
@@ -26,7 +29,9 @@ use gpui::{
     WindowHandle, WindowOptions, actions, px, size,
 };
 
-use app_ui::{AppUi, CloseTab, NewTab, NextTab, PrevTab, ToggleLeft, ToggleRight};
+use app_ui::{
+    AppUi, CloseTab, NewTab, NextTab, PrevTab, ShowAbout, ShowSettings, ToggleLeft, ToggleRight,
+};
 
 actions!(main, [Quit]);
 
@@ -75,11 +80,30 @@ fn main() {
             KeyBinding::new("cmd-b", ToggleLeft, None),
             KeyBinding::new("alt-cmd-b", ToggleRight, None),
             KeyBinding::new("cmd-q", Quit, None),
+            // macOS 惯例：⌘, 打开设置（应用菜单「设置…」同项）。
+            KeyBinding::new("cmd-,", ShowSettings, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
         let root_entity: Entity<AppUi> = cx.new(|cx| AppUi::new(cx));
         *root_slot.borrow_mut() = Some(root_entity.clone());
+
+        // 原生菜单栏：AppUi::new 已写 I18nGlobal，此刻按当前语言注册
+        // （语言切换由 AppUi 的 I18nGlobal 观察者重建）。
+        cx.set_menus(app_ui::app_menus(crate::i18n::current(cx)));
+        // 应用菜单动作走全局监听（任何窗口聚焦时都可用，含无窗口驻留 Dock）。
+        {
+            let root = root_entity.clone();
+            cx.on_action(move |_: &ShowSettings, cx| {
+                let _ = root.update(cx, |ui, cx| ui.open_settings(cx));
+            });
+        }
+        {
+            let root = root_entity.clone();
+            cx.on_action(move |_: &ShowAbout, cx| {
+                let _ = root.update(cx, |ui, cx| ui.open_about(cx));
+            });
+        }
         let window = open_main_window(&root_entity, cx);
 
         window

@@ -12,6 +12,10 @@ use tokio::sync::{mpsc, oneshot};
 use russh::client::{self, Handle};
 use russh::keys::PrivateKeyWithHashAlg;
 
+use crate::transfer::{
+    run_sftp, SftpCmd, TransferRequest, TransferTicket,
+};
+
 const TERM: &str = "xterm-256color";
 
 #[derive(Debug, Clone)]
@@ -29,12 +33,57 @@ pub struct ConnectParams {
     pub auth: AuthMethod,
     pub cols: u16,
     pub rows: u16,
+    /// 连接通道：IP 直连（host:port）或 iroh P2P（host = NodeID，port 未用）。
+    pub transport: Transport,
+}
+
+/// 连接通道形态。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Transport {
+    #[default]
+    Tcp,
+    /// iroh P2P：经 relay 汇合 + QUIC 打洞直连目标端 sshrust-agent。
+    /// relay 未配置时使用 n0 公共设施。
+    Iroh {
+        relay: Option<String>,
+        token: Option<String>,
+    },
+}
+
+/// 连接过程的阶段事件（UI 进度日志用）。
+///
+/// 只描述「进入了哪个阶段」，不带文案与参数——app 层按界面语言渲染，
+/// 目标地址等上下文从 [`ConnectParams`] 取。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectStep {
+    /// TCP 连接目标 host:port（russh connect 内含 SSH 握手）。
+    TcpDial,
+    /// 启动/复用 iroh endpoint（含 relay 配置）。
+    IrohEndpoint,
+    /// 等待网络就绪（与 home relay 建连、地址探测）。
+    IrohOnline,
+    /// 拨号对端（打洞/中继协商）。
+    IrohConnect,
+    /// 打开 QUIC 双向流。
+    IrohStream,
+    /// SSH 版本交换与密钥协商。
+    SshHandshake,
+    /// 用户认证（密码/密钥）。
+    SshAuth,
+    /// 打开会话通道。
+    SshChannel,
+    /// 请求 PTY 与 Shell。
+    SshPty,
+    /// 连接建立完成。
+    Done,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("connect {host}:{port}: {source}")]
     Connect { host: String, port: u16, source: russh::Error },
+    #[error("iroh: {0}")]
+    Iroh(String),
     #[error("auth failed for {0}")]
     AuthFailed(String),
     #[error("parse private key: {source}")]
@@ -50,6 +99,10 @@ enum Cmd {
     Shutdown,
     /// 在独立通道执行一次性命令（目录清单等），结果经 oneshot 回传。
     Exec { cmd: String, reply: oneshot::Sender<Result<String, String>> },
+    /// SFTP 文件传输入队（见 [`crate::transfer`]），票据经 oneshot 回传。
+    Transfer { req: TransferRequest, reply: oneshot::Sender<Result<TransferTicket, String>> },
+    /// 检查远端路径是否已存在（上传覆盖确认用）。
+    SftpExists { path: String, reply: oneshot::Sender<Result<bool, String>> },
 }
 
 /// 会话生命周期事件。
@@ -96,7 +149,7 @@ pub struct OpenedSession {
     pub events: mpsc::UnboundedReceiver<SessionEvent>,
 }
 
-struct ClientHandler;
+pub(crate) struct ClientHandler;
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
@@ -137,6 +190,24 @@ impl Session {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Cmd::Exec { cmd: cmd.into(), reply: tx })
+            .map_err(|_| "session closed".to_string())?;
+        rx.await.map_err(|_| "session closed".to_string())?
+    }
+
+    /// SFTP 文件传输入队：立即返回进度票据（队列串行执行）。
+    pub async fn enqueue_transfer(&self, req: TransferRequest) -> Result<TransferTicket, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::Transfer { req, reply: tx })
+            .map_err(|_| "session closed".to_string())?;
+        rx.await.map_err(|_| "session closed".to_string())?
+    }
+
+    /// 远端路径是否已存在（上传覆盖确认用；走 SFTP 通道，非 shell）。
+    pub async fn sftp_exists(&self, path: impl Into<String>) -> Result<bool, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::SftpExists { path: path.into(), reply: tx })
             .map_err(|_| "session closed".to_string())?;
         rx.await.map_err(|_| "session closed".to_string())?
     }
@@ -190,6 +261,20 @@ impl std::io::Write for SessionWriter {
 
 /// 建立 TCP + SSH 连接，完成认证，打开 pty shell 通道，启动 supervisor。
 pub async fn open_session(params: ConnectParams) -> Result<OpenedSession, SessionError> {
+    open_session_traced(params, None).await
+}
+
+/// [`open_session`] 的带进度版本：各阶段**开始时**经 `progress` 发出
+/// [`ConnectStep`]；接收端已丢弃（send 失败）不影响连接流程。
+pub async fn open_session_traced(
+    params: ConnectParams,
+    progress: Option<mpsc::UnboundedSender<ConnectStep>>,
+) -> Result<OpenedSession, SessionError> {
+    let step = |s: ConnectStep| {
+        if let Some(tx) = progress.as_ref() {
+            let _ = tx.send(s);
+        }
+    };
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(600)),
         keepalive_interval: Some(Duration::from_secs(30)),
@@ -197,18 +282,44 @@ pub async fn open_session(params: ConnectParams) -> Result<OpenedSession, Sessio
         ..Default::default()
     });
 
-    let mut handle: Handle<ClientHandler> = client::connect(
-        config,
-        (params.host.as_str(), params.port),
-        ClientHandler,
-    )
-    .await
-    .map_err(|e| SessionError::Connect {
-        host: params.host.clone(),
-        port: params.port,
-        source: e,
-    })?;
+    let mut handle: Handle<ClientHandler> = match &params.transport {
+        Transport::Tcp => {
+            step(ConnectStep::TcpDial);
+            step(ConnectStep::SshHandshake);
+            client::connect(
+                config,
+                (params.host.as_str(), params.port),
+                ClientHandler,
+            )
+            .await
+            .map_err(|e| SessionError::Connect {
+                host: params.host.clone(),
+                port: params.port,
+                source: e,
+            })?
+        }
+        Transport::Iroh { relay, token } => {
+            // iroh P2P：QUIC 流直连目标端 sshrust-agent（其桥接到本机 sshd）。
+            let stream = crate::iroh::dial_traced(
+                &params.host,
+                relay.as_deref(),
+                token.as_deref(),
+                progress.as_ref(),
+            )
+            .await
+            .map_err(SessionError::Iroh)?;
+            step(ConnectStep::SshHandshake);
+            client::connect_stream(config, stream, ClientHandler)
+                .await
+                .map_err(|e| SessionError::Connect {
+                    host: params.host.clone(),
+                    port: params.port,
+                    source: e,
+                })?
+        }
+    };
 
+    step(ConnectStep::SshAuth);
     let auth_result = match &params.auth {
         AuthMethod::Password(pw) => {
             handle.authenticate_password(&params.username, pw).await?
@@ -226,11 +337,14 @@ pub async fn open_session(params: ConnectParams) -> Result<OpenedSession, Sessio
         return Err(SessionError::AuthFailed(params.username.clone()));
     }
 
+    step(ConnectStep::SshChannel);
     let channel = handle.channel_open_session().await?;
+    step(ConnectStep::SshPty);
     channel
         .request_pty(false, TERM, params.cols as u32, params.rows as u32, 0, 0, &[])
         .await?;
     channel.request_shell(true).await?;
+    step(ConnectStep::Done);
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (data_tx, data_rx) = std::sync::mpsc::channel::<Vec<u8>>();
@@ -261,6 +375,9 @@ async fn supervise(
         let _ = events_tx.send(SessionEvent::Closed { reason: reason.to_string() });
     };
 
+    // SFTP 传输任务句柄：首次传输时懒启动；supervise 退出时 drop → 传输终止。
+    let mut sftp_tx: Option<mpsc::UnboundedSender<SftpCmd>> = None;
+
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
@@ -279,6 +396,24 @@ async fn supervise(
                     tokio::spawn(async move {
                         let _ = reply.send(run_exec(&handle, &cmd).await);
                     });
+                }
+                // SFTP 传输/查询转常驻任务（不阻塞 shell 通道的事件循环）。
+                Some(cmd @ (Cmd::Transfer { .. } | Cmd::SftpExists { .. })) => {
+                    let tx = sftp_tx.get_or_insert_with(|| {
+                        let (tx, rx) = mpsc::unbounded_channel();
+                        let handle = handle.clone();
+                        tokio::spawn(run_sftp(handle, rx));
+                        tx
+                    });
+                    match cmd {
+                        Cmd::Transfer { req, reply } => {
+                            let _ = tx.send(SftpCmd::Enqueue { req, reply });
+                        }
+                        Cmd::SftpExists { path, reply } => {
+                            let _ = tx.send(SftpCmd::Exists { path, reply });
+                        }
+                        _ => unreachable!(),
+                    }
                 }
             },
             msg = channel.wait() => match msg {

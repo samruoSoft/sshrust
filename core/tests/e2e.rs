@@ -1,6 +1,6 @@
 //! Phase 0 端到端验证：进程内 mock 服务器 + 真实 SSH 协议栈。
 //! 覆盖：拒绝错误密码、正确认证、pty+shell 建立、双向字节流、echo 语义、
-//! 远端退出事件、窗口尺寸变更。
+//! 远端退出事件、窗口尺寸变更、SFTP 上传/下载/取消/存在性检查。
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -8,7 +8,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use sshrust_core::session::{open_session, AuthMethod, ConnectParams, SessionError};
-use sshrust_core::{mock, SessionEvent};
+use sshrust_core::Transport;
+use sshrust_core::{mock, SessionEvent, TransferDirection, TransferRequest, TransferSnapshot, TransferStatus, TransferTicket};
 
 fn params(port: u16, auth: AuthMethod) -> ConnectParams {
     ConnectParams {
@@ -18,6 +19,7 @@ fn params(port: u16, auth: AuthMethod) -> ConnectParams {
         auth,
         cols: 80,
         rows: 24,
+                transport: Transport::Tcp,
     }
 }
 
@@ -196,5 +198,183 @@ async fn e2e_invalid_key_content_fails_to_parse() {
         Err(e) => panic!("expected ParseKey, got: {e}"),
         Ok(_) => panic!("expected ParseKey, got Ok"),
     }
+    server.stop();
+}
+
+// ---------- SFTP 文件传输（sftp 子系统通道 + mock 内存 FS） ----------
+
+/// 轮询票据直到离开 Queued/Running（完成/失败/取消），超时 panic。
+async fn wait_finished(ticket: &TransferTicket, timeout: Duration) -> TransferSnapshot {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let s = ticket.snapshot();
+        if !matches!(s.status, TransferStatus::Queued | TransferStatus::Running) {
+            return s;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("transfer not finished in {timeout:?}: {s:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn temp_path(name: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("sshrust-e2e-{}-{}", std::process::id(), name));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+/// 上传 → ls 可见 → 下载读回内容一致；exists 检查同轮验证。
+#[tokio::test]
+async fn e2e_sftp_upload_download_roundtrip() {
+    let server = mock::spawn().await.expect("spawn mock server");
+    let opened = open_session(params(server.port, AuthMethod::Password(mock::MOCK_PASS.into())))
+        .await
+        .expect("open session");
+    let session = opened.session;
+
+    // 200KB 伪随机内容（跨块验证拼接正确性）。
+    let content: Vec<u8> = (0..200_000).map(|i| (i * 31 % 251) as u8).collect();
+    let local = temp_path("up.bin");
+    std::fs::write(&local, &content).expect("write local");
+
+    let ticket = session
+        .enqueue_transfer(TransferRequest {
+            direction: TransferDirection::Upload,
+            local: local.clone(),
+            remote: "/home/test/e2e-upload.bin".into(),
+        })
+        .await
+        .expect("enqueue upload");
+    let snap = wait_finished(&ticket, Duration::from_secs(30)).await;
+    assert!(
+        matches!(snap.status, TransferStatus::Done),
+        "upload status: {:?}",
+        snap.status
+    );
+    assert_eq!(snap.total, content.len() as u64);
+    assert_eq!(snap.done, snap.total);
+
+    // 上传后：exists=true；exec ls 能看到该文件（动态层与 ls 同源）。
+    assert!(session.sftp_exists("/home/test/e2e-upload.bin").await.expect("exists"));
+    let ls = session.exec_output("LC_ALL=C ls -la -- /home/test").await.expect("ls");
+    assert!(ls.contains("e2e-upload.bin"), "ls 应含上传文件：{ls}");
+
+    // 下载读回：内容一致。
+    let back = temp_path("down.bin");
+    let ticket = session
+        .enqueue_transfer(TransferRequest {
+            direction: TransferDirection::Download,
+            local: back.clone(),
+            remote: "/home/test/e2e-upload.bin".into(),
+        })
+        .await
+        .expect("enqueue download");
+    let snap = wait_finished(&ticket, Duration::from_secs(30)).await;
+    assert!(
+        matches!(snap.status, TransferStatus::Done),
+        "download status: {:?}",
+        snap.status
+    );
+    let read_back = std::fs::read(&back).expect("read back");
+    assert_eq!(read_back, content, "上传→下载内容应一致");
+
+    // 不存在的路径 exists=false；下载失败态可观察。
+    assert!(!session.sftp_exists("/home/test/no-such-file").await.expect("exists false"));
+    let missing = temp_path("missing.bin");
+    let ticket = session
+        .enqueue_transfer(TransferRequest {
+            direction: TransferDirection::Download,
+            local: missing.clone(),
+            remote: "/home/test/no-such-file".into(),
+        })
+        .await
+        .expect("enqueue");
+    let snap = wait_finished(&ticket, Duration::from_secs(30)).await;
+    assert!(matches!(snap.status, TransferStatus::Error(_)), "下载缺失文件应报错：{snap:?}");
+
+    let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_file(&back);
+    session.close();
+    server.stop();
+}
+
+/// 下载 canned 文件（notes.txt）：内容/大小与固化源一致。
+#[tokio::test]
+async fn e2e_sftp_download_canned_file() {
+    let server = mock::spawn().await.expect("spawn mock server");
+    let opened = open_session(params(server.port, AuthMethod::Password(mock::MOCK_PASS.into())))
+        .await
+        .expect("open session");
+    let session = opened.session;
+
+    let local = temp_path("notes.txt");
+    let ticket = session
+        .enqueue_transfer(TransferRequest {
+            direction: TransferDirection::Download,
+            local: local.clone(),
+            remote: "/home/test/notes.txt".into(),
+        })
+        .await
+        .expect("enqueue");
+    let snap = wait_finished(&ticket, Duration::from_secs(30)).await;
+    assert!(
+        matches!(snap.status, TransferStatus::Done),
+        "download status: {:?}",
+        snap.status
+    );
+    let content = std::fs::read_to_string(&local).expect("read notes");
+    assert!(content.starts_with("mock notes for sshrust download demo"), "内容：{content:?}");
+    assert_eq!(snap.total, content.len() as u64, "total 应为实际内容大小");
+
+    let _ = std::fs::remove_file(&local);
+    session.close();
+    server.stop();
+}
+
+/// 大文件中途取消：状态转 Canceled 且进度停在半途（done < total）。
+#[tokio::test]
+async fn e2e_sftp_cancel_mid_transfer() {
+    let server = mock::spawn().await.expect("spawn mock server");
+    let opened = open_session(params(server.port, AuthMethod::Password(mock::MOCK_PASS.into())))
+        .await
+        .expect("open session");
+    let session = opened.session;
+
+    // 32MB：本地回环 + 进程内 mock 也需要足够多块，保证取消窗口存在。
+    let content = vec![0xA5u8; 32 * 1024 * 1024];
+    let local = temp_path("big.bin");
+    std::fs::write(&local, &content).expect("write big");
+
+    let ticket = session
+        .enqueue_transfer(TransferRequest {
+            direction: TransferDirection::Upload,
+            local: local.clone(),
+            remote: "/home/test/e2e-big.bin".into(),
+        })
+        .await
+        .expect("enqueue");
+
+    // 等到跑起来且已有进度，随即取消。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = ticket.snapshot();
+        if matches!(s.status, TransferStatus::Running) && s.done > 0 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "等待首个进度超时：{s:?}");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    ticket.cancel();
+    let snap = wait_finished(&ticket, Duration::from_secs(30)).await;
+    assert!(
+        matches!(snap.status, TransferStatus::Canceled),
+        "取消后状态：{:?}",
+        snap.status
+    );
+    assert!(snap.done < snap.total, "进度应停在半途：{}/{}", snap.done, snap.total);
+
+    let _ = std::fs::remove_file(&local);
+    session.close();
     server.stop();
 }

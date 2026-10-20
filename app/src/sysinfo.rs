@@ -543,6 +543,8 @@ impl crate::app_ui::AppUi {
                         }
                     }
                 }
+                // 机器配置摘要（2C 4G 60G）捕获入 db（变化才写，树行徽章展示）。
+                ui.capture_server_spec(tab_id, cx);
                 cx.notify();
             });
         })

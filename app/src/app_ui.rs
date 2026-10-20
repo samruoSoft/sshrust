@@ -21,8 +21,10 @@ use gpui::{
 
 use gpui_terminal::{TerminalConfig, TerminalView};
 
-use sshrust_core::session::open_session;
-use sshrust_core::{mock, AuthMethod, ConnectParams, Session, SessionEvent};
+use sshrust_core::session::open_session_traced;
+use sshrust_core::{
+    mock, AuthMethod, ConnectParams, ConnectStep, Session, SessionEvent, Transport,
+};
 
 use crate::db::{CommandData, Db, NewNode, NodeKind, ROOT_SERVERS, ServerData};
 use crate::icons;
@@ -35,8 +37,28 @@ use crate::theme;
 
 actions!(
     app_ui,
-    [NewTab, CloseTab, NextTab, PrevTab, ToggleLeft, ToggleRight]
+    [
+        NewTab, CloseTab, NextTab, PrevTab, ToggleLeft, ToggleRight, ShowAbout, ShowSettings
+    ]
 );
+
+/// 原生菜单栏（macOS NSMenu，经 `App::set_menus` 注册）。
+/// 首个菜单 = 应用菜单：关于 / 设置（⌘,）/ 退出（⌘Q，快捷键显示由 keymap 匹配）。
+/// 语言切换时由 I18nGlobal 观察者按新 locale 重建。
+pub(crate) fn app_menus(loc: crate::i18n::Locale) -> Vec<gpui::Menu> {
+    let t = |k: crate::i18n::Tr| crate::i18n::tl(loc, k);
+    vec![gpui::Menu {
+        name: "SSHRust".into(),
+        items: vec![
+            gpui::MenuItem::action(t(crate::i18n::Tr::MenuAbout), ShowAbout),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::action(t(crate::i18n::Tr::MenuSettings), ShowSettings),
+            gpui::MenuItem::separator(),
+            // Quit 定义于 main.rs（crate 根），全局监听 cx.quit()。
+            gpui::MenuItem::action(t(crate::i18n::Tr::MenuQuit), crate::Quit),
+        ],
+    }]
+}
 
 /// 右面板宽度拖拽标记。gpui 的 on_drag_move 按标记类型过滤，
 /// 与侧栏的 WidthDrag 分立，两条宽度拖拽才不会互相触发。
@@ -96,6 +118,8 @@ pub struct AppUi {
     pub(crate) tabs: Vec<Tab>,
     pub(crate) active_id: u64,
     next_tab_id: u64,
+    /// tab 最近使用序（最新在前）：关闭激活 tab 时回跳到最近使用的剩余 tab。
+    tab_mru: Vec<u64>,
     /// tab 条横向滚动偏移（px，0 = 最左；溢出时经 ‹ › 按钮移动）。
     pub(crate) tab_scroll_x: f32,
     /// 上次渲染算出的滚动上限（内容宽 − 视口宽；箭头点击钳制用）。
@@ -124,8 +148,18 @@ pub struct AppUi {
     pub(crate) dir_data: HashMap<u64, crate::dir_panel::DirTree>,
     /// 目录面板树组件（kit Tree；展开懒加载/滚动内聚）。
     pub(crate) dir_tree: Entity<TreeState>,
-    /// 目录树 id → 路径映射（展开事件懒加载定位用，随 refresh_dir_tree 重建）。
-    pub(crate) dir_paths: HashMap<usize, String>,
+    /// 目录树 id → (路径, 是否目录) 映射（展开懒加载/右键菜单定位用，随 refresh_dir_tree 重建）。
+    pub(crate) dir_paths: HashMap<usize, (String, bool)>,
+    /// 目录页传输区：每个 tab 一份传输任务列表（SFTP 上传/下载）。
+    pub(crate) transfer_data: HashMap<u64, Vec<crate::transfer::TransferItem>>,
+    /// 传输区列表滚动状态（真实滚动模式）。
+    pub(crate) transfer_scroll: Entity<scroll_area::ScrollAreaState>,
+    /// 上传覆盖确认模态（目标目录已有同名文件）。
+    pub(crate) confirm_overwrite: Option<crate::transfer::ConfirmOverwrite>,
+    /// 连接过程日志（按 tab）：(距发起连接的毫秒, 阶段)。失败页/连接中页展示。
+    pub(crate) connect_log: HashMap<u64, Vec<(u32, ConnectStep)>>,
+    /// P2P 会话网络情况（按 tab；iroh 连接成功后由 netinfo::probe 填充）。
+    pub(crate) net_data: HashMap<u64, crate::netinfo::NetInfo>,
     /// 系统信息面板：每个已连接 tab 一份（探针差分 + 历史）。
     pub(crate) sys_data: HashMap<u64, crate::sysinfo::SysInfo>,
     /// 系统信息页滚动状态（真实滚动模式）。
@@ -154,6 +188,8 @@ pub struct AppUi {
     pub(crate) dir_split_drag: Arc<Mutex<Option<(f32, f32)>>>,
     /// 侧栏宽度（右缘可拖拽调整，持久化）。
     pub(crate) sidebar_w: f32,
+    /// 服务器树行模式：true = 详细两行（别名+徽章 / 地址），false = 简单单行。
+    pub(crate) tree_detail: bool,
     /// 侧栏宽度拖拽锚点（鼠标 x、起始宽度）。
     pub(crate) width_drag: Arc<Mutex<Option<(f32, f32)>>>,
     /// 右侧状态面板宽度（左缘可拖拽调整，持久化）。
@@ -184,6 +220,8 @@ pub struct AppUi {
     /// 目录名称表单对话框窗口（同时一个，再开时复用并激活）。
     pub(crate) folder_form_win:
         Option<ui_kit::pro::dialog::DialogHandle<crate::form_folder_edit::FolderEditForm, crate::form_folder_edit::FolderFormEvent>>,
+    /// 「关于」对话框窗口（同时一个，再开时复用并激活）。
+    pub(crate) about_win: Option<ui_kit::pro::dialog::DialogHandle<crate::about::AboutView>>,
     /// 主窗口自身句柄（表单窗口里发起连接后把主窗带到前台）。
     pub(crate) main_window: Option<gpui::WindowHandle<AppUi>>,
     /// 删除确认模态（替代原生 window.prompt）。
@@ -211,7 +249,9 @@ pub(crate) struct ConfirmDelete {
 
 impl AppUi {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let db = Db::open();
+        let mut db = Db::open();
+        // relay/令牌全局化：旧版按服务器存的值迁入全局设置（一次性）。
+        crate::db::migrate_iroh_to_global(&mut db);
         let theme_idx: usize = db
             .get_setting("theme")
             .and_then(|v| v.parse::<usize>().ok())
@@ -279,6 +319,12 @@ impl AppUi {
         let tree = cx.new(|cx| TreeState::new(cx));
         cx.subscribe(&tree, |this, _, ev, cx| this.on_tree_event(ev, cx)).detach();
         tree.update(cx, |t, cx| t.set_expanded(expanded_kit, cx));
+        // 树行模式（简洁/详细，持久化；缺省详细）。
+        let tree_detail = db
+            .get_setting("sidebar.tree.detail")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        tree.update(cx, |t, cx| t.set_detail(tree_detail, cx));
 
         // 终端滚动状态（虚拟滚动模式；同屏只显示一个终端）。
         let term_scroll_state = cx.new(|_| scroll_area::ScrollAreaState::new(2));
@@ -290,6 +336,7 @@ impl AppUi {
         let procs_scroll = cx.new(|_| scroll_area::ScrollAreaState::new(5));
         // 进程页详情区滚动（真实滚动模式；owner 6）。
         let procs_detail_scroll = cx.new(|_| scroll_area::ScrollAreaState::new(6));
+        let transfer_scroll = cx.new(|_| scroll_area::ScrollAreaState::new(7));
         // 进程页详情区高度（分割线拖拽，持久化）。
         let procs_detail_h = db
             .get_setting(crate::procs::SETTING_PROCS_DETAIL_H)
@@ -314,11 +361,13 @@ impl AppUi {
         cx.observe(&sessions_scroll, |_, _, cx| cx.notify()).detach();
         cx.observe(&procs_scroll, |_, _, cx| cx.notify()).detach();
         cx.observe(&procs_detail_scroll, |_, _, cx| cx.notify()).detach();
+        cx.observe(&transfer_scroll, |_, _, cx| cx.notify()).detach();
 
         let this = Self {
             tabs: Vec::new(),
             active_id: 0,
             next_tab_id: 1,
+            tab_mru: Vec::new(),
             tab_scroll_x: 0.,
             tab_scroll_max: 0.,
             tab_scroll_focus: 0,
@@ -331,6 +380,11 @@ impl AppUi {
             menu: None,
             term_scroll_state,
             dir_data: HashMap::new(),
+            transfer_data: HashMap::new(),
+            transfer_scroll,
+            confirm_overwrite: None,
+            connect_log: HashMap::new(),
+            net_data: HashMap::new(),
             dir_tree,
             dir_paths: HashMap::new(),
             sys_data: HashMap::new(),
@@ -347,12 +401,14 @@ impl AppUi {
             dir_transfer_h,
             dir_split_drag: Arc::new(Mutex::new(None)),
             sidebar_w,
+            tree_detail,
             width_drag: Arc::new(Mutex::new(None)),
             right_w,
             right_width_drag: Arc::new(Mutex::new(None)),
             form_win: None,
             cmd_form_win: None,
             folder_form_win: None,
+            about_win: None,
             main_window: None,
             notice: None,
             server_cmds_prev: None,
@@ -399,6 +455,8 @@ impl AppUi {
         cx.set_global(crate::i18n::I18nGlobal(loc));
         cx.observe_global::<crate::i18n::I18nGlobal>(|this, cx| {
             this.loc = crate::i18n::current(cx);
+            // 原生菜单栏文案随语言即时重建（set_menus 幂等重建 NSMenu）。
+            cx.set_menus(app_menus(this.loc));
             this.refresh_tree(cx);
             this.refresh_dir_tree(cx);
             cx.notify();
@@ -535,11 +593,16 @@ impl AppUi {
         cx: &mut Context<Self>,
     ) {
         let icon = out.icon.clone();
+        // relay/令牌已迁全局设置（db::iroh_global）；ServerData 的旧字段仅作兼容保留。
         let data = ServerData {
             host: out.host,
             port: out.port,
             username: out.username,
             auth: out.auth,
+            mode: out.mode,
+            iroh_relay: String::new(),
+            iroh_token: String::new(),
+            spec: String::new(),
         };
         let node_id = match out.editing {
             Some(id) => {
@@ -850,9 +913,7 @@ impl AppUi {
             TabKind::Connecting { params: p } => p.host == params.host && p.port == params.port,
             _ => false,
         }) {
-            self.active_id = existing.id;
-            self.maybe_fetch_dir(cx);
-            cx.notify();
+            self.activate_tab(existing.id, cx);
             return;
         }
         let tab_id = self.next_tab_id;
@@ -863,10 +924,8 @@ impl AppUi {
             icon,
             kind: TabKind::Connecting { params },
         });
-        self.active_id = tab_id;
+        self.activate_tab(tab_id, cx);
         self.refresh_tree(cx);
-        self.maybe_fetch_dir(cx);
-        cx.notify();
         self.connect_tab(tab_id, cx);
     }
 
@@ -951,6 +1010,34 @@ impl AppUi {
         crate::settings_view::open_settings(&cx.entity(), cx);
     }
 
+    /// 打开「关于」对话框（固定尺寸；已开时复用并带到前台）。
+    pub(crate) fn open_about(&mut self, cx: &mut Context<Self>) {
+        if let Some(h) = self.about_win.take() {
+            if h.is_open(cx) {
+                h.activate(cx);
+                self.about_win = Some(h);
+                return;
+            }
+        }
+        let view = cx.new(|cx| crate::about::AboutView::new(cx));
+        let spec = ui_kit::pro::dialog::DialogSpec {
+            title: crate::i18n::t(cx, crate::i18n::Tr::MenuAbout).to_string(),
+            width: 360.,
+            height: 300.,
+            min_width: 360.,
+            min_height: 300.,
+            resizable: false,
+            surface_alpha: Some(theme::surface_fx(cx).alpha),
+            surface_blur: theme::bg_fx(cx).blur,
+            ..Default::default()
+        };
+        let handle =
+            ui_kit::pro::dialog::open_dialog_themed(view, spec, theme::current(cx).kit(), cx);
+        // 开窗建立的模糊视图需要按当前主题系列 tint（幂等）。
+        ui_kit::platform::set_blur_tint(!theme::is_light(cx));
+        self.about_win = Some(handle);
+    }
+
     /// 切换界面主题。系列（深/浅）翻转时终端配色联动到该系列记忆值；
     /// 系列内切换不动终端配色——两套配置独立、仅黑白系列同步。
     pub(crate) fn set_ui_theme(&mut self, idx: usize, cx: &mut Context<Self>) {
@@ -973,19 +1060,42 @@ impl AppUi {
     }
 
     /// 后台执行连接；成功将 tab 置为 Live，失败置为 Failed。订阅关闭事件。
+    /// 连接各阶段经 [`ConnectStep`] 实时汇入 `connect_log`（连接中/失败页展示）。
     fn connect_tab(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
         let TabKind::Connecting { params } = &tab.kind else { return };
         let params = params.clone();
         let title = tab.title.clone();
 
+        self.connect_log.insert(tab_id, Vec::new());
         cx.spawn(async move |this: WeakEntity<AppUi>, cx: &mut gpui::AsyncApp| {
-            let result = super::RUNTIME
+            let (step_tx, mut step_rx) = tokio::sync::mpsc::unbounded_channel::<ConnectStep>();
+            let started = std::time::Instant::now();
+            // cx 以参数传入（闭包不持有借用），后续 this.update 不与之冲突。
+            let record = |step: ConnectStep, cx: &mut gpui::AsyncApp| {
+                let ms = started.elapsed().as_millis() as u32;
+                let _ = this.update(cx, |ui: &mut AppUi, cx: &mut Context<AppUi>| {
+                    ui.connect_log.entry(tab_id).or_default().push((ms, step));
+                    cx.notify();
+                });
+            };
+            let mut task = super::RUNTIME
                 .get()
                 .expect("tokio runtime")
-                .spawn(open_session(params.clone()))
-                .await
-                .expect("join open_session");
+                .spawn(open_session_traced(params.clone(), Some(step_tx)));
+            // 进度事件与连接结果并发汇流：步骤实时落日志，通道关闭即收尾。
+            let result = loop {
+                tokio::select! {
+                    step = step_rx.recv() => match step {
+                        Some(step) => record(step, cx),
+                        None => break task.await.expect("join open_session"),
+                    },
+                    res = &mut task => break res.expect("join open_session"),
+                }
+            };
+            while let Ok(step) = step_rx.try_recv() {
+                record(step, cx);
+            }
 
             let _ = this.update(cx, |ui: &mut AppUi, cx: &mut Context<AppUi>| {
                 let config = ui.terminal_config(cx);
@@ -1034,6 +1144,13 @@ impl AppUi {
                         })
                         .detach();
 
+                        // P2P 网络探测材料先取好（tab 借用在后续 ui.* 调用前结束）。
+                        let probe_args = match params.transport.clone() {
+                            Transport::Iroh { relay, token } => {
+                                Some((params.host.clone(), relay, token, session.clone()))
+                            }
+                            Transport::Tcp => None,
+                        };
                         tab.kind = TabKind::Live {
                             term,
                             session,
@@ -1045,8 +1162,22 @@ impl AppUi {
                         ui.maybe_fetch_dir(cx);
                         let _ = stats;
                         let _ = title;
+                        // 连接成功即收掉过程日志；P2P 会话另起网络探测（链路/双端出口）。
+                        // 先登记空条目：probe 只更新已存在条目，tab 关闭清条目即探测自停。
+                        ui.connect_log.remove(&tab_id);
+                        if let Some((node, relay, token, probe_session)) = probe_args {
+                            ui.net_data.entry(tab_id).or_default();
+                            cx.spawn(async move |this3, cx3| {
+                                crate::netinfo::probe(
+                                    tab_id, node, relay, token, probe_session, this3, cx3,
+                                )
+                                .await;
+                            })
+                            .detach();
+                        }
                     }
                     Err(e) => {
+                        // 失败保留过程日志（失败页展示，便于定位卡在哪个阶段）。
                         tab.kind = TabKind::Failed { params, error: e.to_string() };
                     }
                 }
@@ -1067,8 +1198,20 @@ impl AppUi {
         }
         let tab = self.tabs.remove(idx);
         if self.active_id == id {
-            self.active_id = self.tabs.first().map(|t| t.id).unwrap_or(0);
+            // 弹出的是激活 tab：回最近使用的剩余 tab（无记录回第一个）。
+            let next = self
+                .tab_mru
+                .iter()
+                .find(|&&x| x != id && self.tabs.iter().any(|t| t.id == x))
+                .copied()
+                .or_else(|| self.tabs.first().map(|t| t.id));
+            if let Some(n) = next {
+                self.activate_tab(n, cx);
+            } else {
+                self.active_id = 0;
+            }
         }
+        self.tab_mru.retain(|&x| x != id);
         let tab_id = tab.id;
         let params = match &tab.kind {
             TabKind::Live { session, .. } => session.params.clone(),
@@ -1191,16 +1334,30 @@ impl AppUi {
                 session.close();
             }
             self.tabs.remove(pos);
-            // 目录/系统信息数据随会话释放（tab id 不复用，直接删）。
+            // 目录/系统信息/传输数据随会话释放（tab id 不复用，直接删）。
             self.dir_data.remove(&id);
             self.sys_data.remove(&id);
+            self.connect_log.remove(&id);
+            self.net_data.remove(&id);
+            if let Some(items) = self.transfer_data.remove(&id) {
+                for it in items {
+                    it.ticket.cancel();
+                }
+            }
             if self.tabs.is_empty() {
                 // 允许空：中间显示空态提示
                 cx.notify();
             } else if self.active_id == id {
-                let next = pos.min(self.tabs.len() - 1);
-                self.active_id = self.tabs[next].id;
+                // 回最近使用的剩余 tab（无记录回邻近位）。
+                let next = self
+                    .tab_mru
+                    .iter()
+                    .find(|&&x| x != id && self.tabs.iter().any(|t| t.id == x))
+                    .copied()
+                    .unwrap_or_else(|| self.tabs[pos.min(self.tabs.len() - 1)].id);
+                self.activate_tab(next, cx);
             }
+            self.tab_mru.retain(|&x| x != id);
             self.maybe_fetch_dir(cx);
             // 在线圆点 / 专用命令组随连接消失。
             self.refresh_tree(cx);
@@ -1219,8 +1376,7 @@ impl AppUi {
         }
         let pos = self.tabs.iter().position(|t| t.id == self.active_id).unwrap_or(0);
         let next = (pos as i32 + dir).rem_euclid(self.tabs.len() as i32) as usize;
-        self.active_id = self.tabs[next].id;
-        self.maybe_fetch_dir(cx);
+        self.activate_tab(self.tabs[next].id, cx);
         self.refresh_tree(cx);
         cx.notify();
     }
@@ -1272,6 +1428,8 @@ impl AppUi {
                         ui.maybe_probe_sysinfo(cx);
                         // 进程页探针自带 sleep 1，maybe 内另按 4s 节流。
                         ui.maybe_probe_procs(cx);
+                        // 传输区：速度差分 + 完成回执（上传完刷新目录树）。
+                        ui.tick_transfers(cx);
                         cx.notify();
                     }
                 }) else {
@@ -1525,12 +1683,9 @@ impl AppUi {
             .overflow_hidden()
             .text_size(px(12.5))
             .on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
-                this.active_id = id;
-                // 新激活 tab 的清单若未缓存（隐藏期间 cd 过）在此补取；内含重建树。
-                this.maybe_fetch_dir(cx);
+                this.activate_tab(id, cx);
                 // 专用命令组跟随激活 tab 的服务器。
                 this.refresh_tree(cx);
-                cx.notify();
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -1581,6 +1736,8 @@ impl AppUi {
                     .hover(|s| s.bg(rgb(pal.border)).text_color(rgb(pal.text)))
                     .child("×")
                     .on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
+                        // 阻止冒泡：父级 tab 按钮的激活会把已关闭的 tab 重新置为激活。
+                        cx.stop_propagation();
                         this.close_tab_by_id(id, cx);
                     })),
             )
@@ -1789,6 +1946,7 @@ impl AppUi {
                 _ => ("—".into(), "—".into(), "—".into()),
             };
             let active = tab.id == self.active_id;
+            let stat_tab_id = tab.id;
             let mut row = div()
                     .id(("stat", tab.id as usize))
                     .flex_col()
@@ -1796,12 +1954,15 @@ impl AppUi {
                     .px_3()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(pal.divider()));
+                    .cursor_pointer()
+                    .border_color(rgb(pal.divider()))
+                    .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+                        this.activate_tab(stat_tab_id, cx);
+                    }));
             if active {
                 row = row.bg(rgb(pal.border));
             }
-            rows.push(
-                row
+            let mut row = row
                     .child(
                         div()
                             .flex()
@@ -1833,9 +1994,16 @@ impl AppUi {
                             .child(format!("↓ {down}"))
                             .child(format!("↑ {up}"))
                             .child(format!("⏱ {dur}")),
-                    )
-                    .into_any_element(),
-            );
+                    );
+            // P2P 会话：链路（直连/中继）+ 双端公网出口。
+            if let TabKind::Live { session, .. } = &tab.kind {
+                if matches!(session.params.transport, Transport::Iroh { .. }) {
+                    for line in self.net_rows(tab.id) {
+                        row = row.child(line);
+                    }
+                }
+            }
+            rows.push(row.into_any_element());
         }
         let content_w = (self.right_w - 14.).max(120.);
         let area = div()
@@ -2065,7 +2233,19 @@ impl AppUi {
     fn render_center(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
         let pal = self.theme();
         let Some(tab) = self.tabs.iter().find(|t| t.id == self.active_id) else {
-            return div().size_full().bg(pal.surface(pal.bg)).into_any_element();
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(pal.surface(pal.bg))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(pal.dim))
+                        .child(crate::i18n::t(cx, crate::i18n::Tr::EmptyTabsHint)),
+                )
+                .into_any_element();
         };
         // 像素级：center 区域显式宽高（不再依赖 stretch/percentage 解析）
         let (win_w, win_h): (f32, f32) = {
@@ -2076,7 +2256,7 @@ impl AppUi {
         let center_h = (win_h - TITLEBAR_H).max(0.);
         match &tab.kind {
             TabKind::Connecting { params } => {
-                let target = format!("{}:{}", params.host, params.port);
+                // 展示名 = 别名（tab.title 建立时已按 别名>host>NodeID前8 位解析）。
                 div()
                     .absolute()
                     .top_0()
@@ -2085,17 +2265,12 @@ impl AppUi {
                     .h(px(center_h))
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap_3()
                     .items_center()
                     .justify_center()
                     .bg(pal.surface(pal.bg))
-                    .child(div().text_size(px(15.)).child(crate::i18n::tf(cx, crate::i18n::Tr::ConnectingTo, &[&target])))
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(pal.muted))
-                            .child(crate::i18n::t(cx, crate::i18n::Tr::ConnectingSteps)),
-                    )
+                    .child(div().text_size(px(15.)).child(crate::i18n::tf(cx, crate::i18n::Tr::ConnectingTo, &[&tab.title])))
+                    .child(self.connect_log_box(tab.id, params))
                     .into_any_element()
             }
             TabKind::Live { term, session, opened_at } => {
@@ -2104,9 +2279,10 @@ impl AppUi {
                     window.focus(&term_handle);
                 }
                 let (down, up) = session.stats.bytes();
-                let target = format!("{}:{}", session.params.host, session.params.port);
                 let user = session.params.username.clone();
                 let tab_id = tab.id;
+                // 链路标签（仅 P2P）：直连/中继/混合，探测完成前显示「检测中」。
+                let path_chip = self.net_path_chip(tab.id, session, cx);
                 // 注意：终端区不能用嵌套列里的 flex_1（gpui 0.2.2 实测高度塌 0，
                 // 终端空白），改为绝对定位：终端填 [0, 状态栏高]，状态栏钉底。
                 let term_h = (center_h - 26.).max(0.);
@@ -2162,28 +2338,49 @@ impl AppUi {
                             .bg(pal.surface(pal.panel))
                             .border_t_1()
                             .border_color(rgb(pal.divider()))
-                            .child(div().text_size(px(11.)).text_color(rgb(pal.ok)).child("●"))
-                            .child(
+                    .child(div().text_size(px(11.)).text_color(rgb(pal.ok)).child("●"))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(pal.muted))
+                            .child(format!("{} · {}", tab.title, user)),
+                    )
+                    .children(path_chip)
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(pal.dim))
+                            .child(format!(
+                                "↓ {} ↑ {} · {}",
+                                fmt_bytes(down),
+                                fmt_bytes(up),
+                                fmt_duration(self.loc, opened_at.elapsed().as_secs())
+                            )),
+                    )
+                    .child(div().flex_1())
+                    .children(
+                        // 会话往返延迟（实测；随承流路径变化）：≤30ms 绿 / ≤80ms 黄 / 更高红。
+                        self.net_data
+                            .get(&tab.id)
+                            .and_then(|n| n.rtt_ms)
+                            .map(|ms| {
+                                let color = if ms <= 30 {
+                                    pal.ok
+                                } else if ms <= 80 {
+                                    pal.warn
+                                } else {
+                                    pal.error
+                                };
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgb(pal.muted))
-                                    .child(format!("{target} · {user}")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(pal.dim))
-                                    .child(format!(
-                                        "↓ {} ↑ {} · {}",
-                                        fmt_bytes(down),
-                                        fmt_bytes(up),
-                                        fmt_duration(self.loc, opened_at.elapsed().as_secs())
-                                    )),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .id(("btn-tab-disconnect", tab_id as usize))
+                                    .text_color(rgb(color))
+                                    .child(format!("{ms} ms"))
+                                    .into_any_element()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id(("btn-tab-disconnect", tab_id as usize))
                                     .px_2()
                                     .h(px(18.))
                                     .flex()
@@ -2209,7 +2406,6 @@ impl AppUi {
             }
             TabKind::Failed { params, error } => {
                 let tab_id = tab.id;
-                let target = format!("{}:{}", params.host, params.port);
                 div()
                     .absolute()
                     .top_0()
@@ -2222,7 +2418,7 @@ impl AppUi {
                     .justify_center()
                     .gap_3()
                     .bg(pal.surface(pal.bg))
-                    .child(div().text_size(px(15.)).text_color(rgb(pal.error)).child(crate::i18n::tf(cx, crate::i18n::Tr::ConnFailed, &[&target])))
+                    .child(div().text_size(px(15.)).text_color(rgb(pal.error)).child(crate::i18n::tf(cx, crate::i18n::Tr::ConnFailed, &[&tab.title])))
                     .child(
                         div()
                             .text_size(px(12.))
@@ -2230,6 +2426,8 @@ impl AppUi {
                             .max_w(px(480.))
                             .child(error.clone()),
                     )
+                    // 过程日志随失败保留——定位卡在哪个阶段。
+                    .child(self.connect_log_box(tab_id, params))
                     .child(
                         div()
                             .flex()
@@ -2275,6 +2473,247 @@ impl AppUi {
         }
     }
 
+    // ---------- 连接过程日志 / P2P 网络情况（渲染辅助） ----------
+
+    /// 阶段文案（带目标/认证方式参数；语言实时取）。
+    fn connect_step_text(&self, params: &ConnectParams, step: ConnectStep) -> String {
+        use crate::i18n::Tr;
+        let loc = self.loc;
+        let t = |k: Tr| crate::i18n::tl(loc, k).to_string();
+        let tf = |k: Tr, args: &[&str]| crate::i18n::tlf(loc, k, args);
+        match step {
+            ConnectStep::TcpDial => {
+                tf(Tr::StepTcp, &[&format!("{}:{}", params.host, params.port)])
+            }
+            ConnectStep::IrohEndpoint => t(Tr::StepIrohEndpoint),
+            ConnectStep::IrohOnline => t(Tr::StepIrohOnline),
+            ConnectStep::IrohConnect => {
+                let short: String = params.host.chars().take(8).collect();
+                tf(Tr::StepIrohConnect, &[&short])
+            }
+            ConnectStep::IrohStream => t(Tr::StepIrohStream),
+            ConnectStep::SshHandshake => t(Tr::StepSshHandshake),
+            ConnectStep::SshAuth => {
+                let how = match &params.auth {
+                    AuthMethod::Password(_) => t(Tr::AuthPassword),
+                    AuthMethod::Key { .. } => t(Tr::AuthKey),
+                };
+                tf(Tr::StepSshAuth, &[&how])
+            }
+            ConnectStep::SshChannel => t(Tr::StepSshChannel),
+            ConnectStep::SshPty => t(Tr::StepSshPty),
+            ConnectStep::Done => t(Tr::StepDone),
+        }
+    }
+
+    /// 连接过程日志框（连接中/失败页共用）：等宽多行，新行自底增长。
+    /// 无日志时返回空元素（占位不影响布局）。
+    fn connect_log_box(&self, tab_id: u64, params: &ConnectParams) -> AnyElement {
+        let pal = self.theme();
+        let Some(steps) = self.connect_log.get(&tab_id) else {
+            return div().into_any_element();
+        };
+        if steps.is_empty() {
+            return div().into_any_element();
+        }
+        let mut lines = div().flex().flex_col().gap(px(2.));
+        for (ms, step) in steps {
+            lines = lines.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .flex_none()
+                            .text_color(rgb(pal.dim))
+                            .child(fmt_step_ms(*ms)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgb(match step {
+                                ConnectStep::Done => pal.ok,
+                                _ => pal.muted,
+                            }))
+                            .child(self.connect_step_text(params, *step)),
+                    ),
+            );
+        }
+        div()
+            .id(gpui::SharedString::from(format!("conn-log-{tab_id}")))
+            .w(px(430.))
+            .max_h(px(230.))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .justify_end()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(pal.divider()))
+            .bg(pal.surface(pal.panel))
+            .p_3()
+            .font_family("Menlo")
+            .text_size(px(11.))
+            .child(lines)
+            .into_any_element()
+    }
+
+    /// 状态栏链路标签（仅 P2P 会话）：直连/中继/混合；探测中显示「网络检测中…」。
+    /// 悬停 tooltip 解释当前模式的含义（多语言即时生效）。
+    fn net_path_chip(
+        &self,
+        tab_id: u64,
+        session: &Session,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if !matches!(session.params.transport, Transport::Iroh { .. }) {
+            return None;
+        }
+        let pal = self.theme();
+        let kit = pal.kit();
+        let t = |k: crate::i18n::Tr| crate::i18n::t(cx, k);
+        let (label, color, tip) = match self.net_data.get(&tab_id).and_then(|n| n.path.as_ref()) {
+            Some(Ok(p)) => {
+                let (label, tip_key) = if p.direct.is_some() && p.relayed {
+                    (t(crate::i18n::Tr::NetMixed), crate::i18n::Tr::NetTipMixed)
+                } else if p.direct.is_some() {
+                    (t(crate::i18n::Tr::NetDirect), crate::i18n::Tr::NetTipDirect)
+                } else {
+                    (t(crate::i18n::Tr::NetRelay), crate::i18n::Tr::NetTipRelay)
+                };
+                let color = if p.direct.is_some() && p.relayed {
+                    pal.accent
+                } else if p.direct.is_some() {
+                    pal.ok
+                } else {
+                    pal.warn
+                };
+                (label, color, Some(tip_key))
+            }
+            Some(Err(_)) => (t(crate::i18n::Tr::NetUnknown), pal.dim, None),
+            None => (t(crate::i18n::Tr::NetDetecting), pal.dim, None),
+        };
+        let mut chip = div().id(("net-path-chip", tab_id as usize)).text_size(px(11.)).text_color(rgb(color));
+        if let Some(tip_key) = tip {
+            chip = chip.tooltip(move |_, cx| {
+                ui_kit::base::tooltip::tip(crate::i18n::t(cx, tip_key), kit, cx)
+            });
+        }
+        Some(chip.child(label).into_any_element())
+    }
+
+    /// 会话状态页·P2P 网络行（链路 / 本端 / 对端；逐项显示探测进度）。
+    fn net_rows(&self, tab_id: u64) -> Vec<AnyElement> {
+        use crate::i18n::Tr;
+        let pal = self.theme();
+        let loc = self.loc;
+        let t = |k: Tr| crate::i18n::tl(loc, k);
+        let net = match self.net_data.get(&tab_id) {
+            Some(n) => n,
+            None => return Vec::new(),
+        };
+        let mut rows = Vec::new();
+        let line = |label: &str, value: String, color: u32| {
+            div()
+                .flex()
+                .justify_between()
+                .text_size(px(10.5))
+                .child(div().text_color(rgb(pal.dim)).child(label.to_string()))
+                .child(div().text_color(rgb(color)).child(value))
+                .into_any_element()
+        };
+        // 链路（悬停 tooltip 解释当前模式含义）
+        let (value, color, tip_key) = match net.path.as_ref() {
+            Some(Ok(p)) => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(d) = &p.direct {
+                    parts.push(format!("{} {}", t(Tr::NetDirect), d));
+                }
+                if p.relayed {
+                    parts.push(format!("{} {}", t(Tr::NetRelay), p.relay_url.as_deref().unwrap_or("")));
+                }
+                let tip_key = if p.direct.is_some() && p.relayed {
+                    Tr::NetTipMixed
+                } else if p.direct.is_some() {
+                    Tr::NetTipDirect
+                } else {
+                    Tr::NetTipRelay
+                };
+                (parts.join(" + "), pal.text, Some(tip_key))
+            }
+            Some(Err(_)) => (t(Tr::NetDetectFail).to_string(), pal.dim, None),
+            None => (t(Tr::NetDetecting).to_string(), pal.dim, None),
+        };
+        let mut path_row = div()
+            .id(("net-path-row", tab_id as usize))
+            .flex()
+            .justify_between()
+            .text_size(px(10.5))
+            .child(div().text_color(rgb(pal.dim)).child(t(Tr::NetPath)))
+            .child(div().text_color(rgb(color)).child(value));
+        if let Some(k) = tip_key {
+            let kit = pal.kit();
+            path_row = path_row.tooltip(move |_, cx| {
+                ui_kit::base::tooltip::tip(crate::i18n::t(cx, k), kit, cx)
+            });
+        }
+        rows.push(path_row.into_any_element());
+        // 本端 / 对端
+        for (label, item) in [
+            (t(Tr::NetLocal), &net.local),
+            (t(Tr::NetRemote), &net.remote),
+        ] {
+            let (value, color) = match item {
+                Some(Ok(i)) => (format!("{} · {} · {}", i.ip, i.country, i.isp), pal.muted),
+                Some(Err(_)) => (t(Tr::NetDetectFail).to_string(), pal.dim),
+                None => (t(Tr::NetDetecting).to_string(), pal.dim),
+            };
+            rows.push(line(&label, value, color));
+        }
+        // 会话往返延迟（实测）：中继 ≈ 50ms 级 / 直连 ≈ 10ms 级，切换即时反映。
+        if let Some(ms) = net.rtt_ms {
+            rows.push(line(&t(Tr::NetRtt), format!("{ms} ms"), pal.muted));
+        }
+        rows
+    }
+
+    /// 从系统信息捕获机器配置摘要（"2C 4G 60G"）写回服务器节点。
+    /// sysinfo 探针每次成功 ingest 后调用；与库内值一致时跳过（不刷树）。
+    pub(crate) fn capture_server_spec(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some((cores, mem_total, disk_total)) = self.sys_data.get(&tab_id).and_then(|st| {
+            let s = st.stat.as_ref()?;
+            let l = st.live.as_ref()?;
+            Some((s.cores, l.mem_total, l.disk_total))
+        }) else {
+            return;
+        };
+        // 按 1000 进制（GB）取整：与硬件标称一致（df/meminfo 的 GiB 换算会偏小）。
+        let gb = |b: u64| (b as f64 / 1e9).round() as u64;
+        let spec = format!("{}C {}G {}G", cores.max(1), gb(mem_total), gb(disk_total));
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+        let TabKind::Live { session, .. } = &tab.kind else { return };
+        let params = &session.params;
+        let Some(node) = self.db.server_by_addr(&params.host, params.port).cloned() else { return };
+        let NodeKind::Server(mut data) = node.kind else { return };
+        if data.spec == spec {
+            return;
+        }
+        data.spec = spec;
+        self.db.update_node(node.id, &node.name, NodeKind::Server(data));
+        self.refresh_tree(cx);
+    }
+
+    /// 激活 tab：置激活 + 记录最近使用序（MRU）+ 目录补取。
+    /// 需要联动树的调用方（tab 点击/新连接）随后自行 refresh_tree。
+    fn activate_tab(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.active_id = id;
+        self.tab_mru.retain(|&x| x != id);
+        self.tab_mru.insert(0, id);
+        self.maybe_fetch_dir(cx);
+        cx.notify();
+    }
+
     pub fn retry_tab(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             let params = match &tab.kind {
@@ -2313,6 +2752,7 @@ fn mock_params(port: u16) -> ConnectParams {
         auth: AuthMethod::Password(mock::MOCK_PASS.into()),
         cols: 100,
         rows: 30,
+        transport: Transport::Tcp,
     }
 }
 
@@ -2348,6 +2788,7 @@ impl Render for AppUi {
         let right_toolbar = self.render_right_toolbar(win_h, cx);
         let overlay = self.render_menu_overlay(window, cx);
         let confirm = self.render_confirm_modal(cx);
+        let overwrite = self.render_overwrite_modal(cx);
         let notice = self.render_notice(win_w);
 
         div()
@@ -2398,6 +2839,7 @@ impl Render for AppUi {
             .child(right_toolbar)
             .children(overlay)
             .children(confirm)
+            .children(overwrite)
             .children(notice)
     }
 }

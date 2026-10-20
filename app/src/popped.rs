@@ -261,7 +261,8 @@ impl Render for TerminalStandalone {
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(pal.muted))
-                            .child(format!("{target} · {user}")),
+                            // 控制台下方状态栏展示别名（顶栏另有 host:port 详情）。
+                            .child(format!("{} · {}", tab.title, user)),
                     )
                     .child(
                         div()

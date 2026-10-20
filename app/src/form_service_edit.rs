@@ -9,10 +9,10 @@ use gpui::{
     div, prelude::*, px, rgb,
 };
 
-use sshrust_core::{AuthMethod, ConnectParams};
+use sshrust_core::{AuthMethod, ConnectParams, Transport};
 
 use crate::app_ui::{AppUi, CloseTab};
-use crate::db::ServerData;
+use crate::db::{ConnectMode, ServerData};
 use crate::hosts::StoredAuth;
 use crate::icons;
 use crate::theme;
@@ -44,6 +44,7 @@ pub(crate) struct ServerFormOutput {
     pub port: u16,
     pub username: String,
     pub auth: StoredAuth,
+    pub mode: ConnectMode,
 }
 
 /// 打开表单时的初始数据：None = 新增；Some((节点 id, 名称, 数据, 节点图标)) = 编辑。
@@ -65,6 +66,10 @@ pub struct ServiceEditForm {
     pass_f: Entity<TextField>,
     key_f: Entity<TextArea>,
     auth_mode: AuthMode,
+    /// 连接方式：IP 直连 / iroh P2P（地址字段随之切换：主机名 ↔ NodeID 多行）。
+    conn_mode: ConnectMode,
+    /// NodeID 编辑（多行、自动换行）：64 hex 单行放不下。
+    node_f: Entity<TextArea>,
     error: Option<String>,
     notice: Option<(bool, String)>,
     testing: bool,
@@ -111,6 +116,8 @@ impl ServiceEditForm {
                 )
             }),
             auth_mode: AuthMode::Password,
+            conn_mode: ConnectMode::Ip,
+            node_f: cx.new(|cx| TextArea::new("", 2, cx)),
             error: None,
             notice: None,
             testing: false,
@@ -136,6 +143,9 @@ impl ServiceEditForm {
                 self.user_f
                     .update(cx, |f, cx| f.set_value(data.username.clone(), cx));
                 self.alias_f.update(cx, |f, cx| f.set_value(name, cx));
+                self.conn_mode = data.mode;
+                self.node_f
+                    .update(cx, |f, cx| f.set_value(data.host.clone(), cx));
                 match &data.auth {
                     StoredAuth::Password(pw) => {
                         self.auth_mode = AuthMode::Password;
@@ -163,7 +173,9 @@ impl ServiceEditForm {
                     f.update(cx, |field, cx| field.set_value("", cx));
                 }
                 self.key_f.update(cx, |f, cx| f.set_value("", cx));
+                self.node_f.update(cx, |f, cx| f.set_value("", cx));
                 self.auth_mode = AuthMode::Password;
+                self.conn_mode = ConnectMode::Ip;
             }
         }
         cx.notify();
@@ -303,6 +315,32 @@ impl ServiceEditForm {
 
     // ---------- 连接（新 Tab） ----------
 
+    /// 当前地址值：IP 模式 = 主机名；iroh 模式 = NodeID（压掉换行/空白）。
+    fn addr_value(&self, cx: &App) -> String {
+        match self.conn_mode {
+            ConnectMode::Ip => self.host_f.read(cx).value().trim().to_string(),
+            ConnectMode::Iroh => self
+                .node_f
+                .read(cx)
+                .value()
+                .split_whitespace()
+                .collect::<String>(),
+        }
+    }
+
+    /// 连接目标的展示名：别名优先；IP = 主机名；iroh = NodeID 前 8 位。
+    fn display_target(&self, cx: &App) -> String {
+        let alias = self.alias_f.read(cx).value().trim().to_string();
+        if !alias.is_empty() {
+            return alias;
+        }
+        let host = self.addr_value(cx);
+        match self.conn_mode {
+            ConnectMode::Ip => host,
+            ConnectMode::Iroh => host.chars().take(8).collect(),
+        }
+    }
+
     fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let params = match self.collect_params(cx) {
             Ok(p) => p,
@@ -313,12 +351,7 @@ impl ServiceEditForm {
                 return;
             }
         };
-        let alias = self.alias_f.read(cx).value().trim().to_string();
-        let title = if alias.is_empty() {
-            params.host.clone()
-        } else {
-            alias
-        };
+        let title = self.display_target(cx);
         let icon = icons::icon_for_name(&title, "server");
         if let Some(main) = self.main.upgrade() {
             let _ = main.update(cx, |ui, cx| {
@@ -348,7 +381,14 @@ impl ServiceEditForm {
                 return;
             }
         };
-        let target = format!("{}:{}", params.host, params.port);
+        let target = match self.conn_mode {
+            ConnectMode::Ip => format!(
+                "{}:{}",
+                self.host_f.read(cx).value().trim(),
+                self.port_f.read(cx).value().trim()
+            ),
+            ConnectMode::Iroh => self.display_target(cx),
+        };
         self.error = None;
         self.notice = Some((true, crate::i18n::tf(cx, crate::i18n::Tr::Testing, &[&target])));
         self.testing = true;
@@ -414,15 +454,26 @@ impl ServiceEditForm {
     }
 
     fn collect_output(&mut self, cx: &App) -> Option<ServerFormOutput> {
-        let Ok(port) = self.port_f.read(cx).value().trim().parse::<u16>() else {
-            self.error = Some(crate::i18n::t(cx, crate::i18n::Tr::ErrPortInvalid).into());
-            return None;
+        let (port, transport) = match self.conn_mode {
+            ConnectMode::Ip => {
+                let Ok(port) = self.port_f.read(cx).value().trim().parse::<u16>() else {
+                    self.error = Some(crate::i18n::t(cx, crate::i18n::Tr::ErrPortInvalid).into());
+                    return None;
+                };
+                (port, Transport::Tcp)
+            }
+            ConnectMode::Iroh => (0, self.iroh_transport(cx)),
         };
-        let host = self.host_f.read(cx).value().trim().to_string();
+        let host = self.addr_value(cx);
         if host.is_empty() {
             self.error = Some(crate::i18n::t(cx, crate::i18n::Tr::ErrHostEmpty).into());
             return None;
         }
+        if matches!(self.conn_mode, ConnectMode::Iroh) && !is_node_id(&host) {
+            self.error = Some(crate::i18n::t(cx, crate::i18n::Tr::ErrNodeId).into());
+            return None;
+        }
+        let _ = transport;
         let user = self.user_f.read(cx).value();
         let alias = self.alias_f.read(cx).value().trim().to_string();
         let auth = match self.auth_mode {
@@ -439,7 +490,10 @@ impl ServiceEditForm {
             }
         };
         let name = if alias.is_empty() {
-            host.clone()
+            match self.conn_mode {
+                ConnectMode::Ip => host.clone(),
+                ConnectMode::Iroh => host.chars().take(8).collect(),
+            }
         } else {
             alias
         };
@@ -452,22 +506,45 @@ impl ServiceEditForm {
             port,
             username: user,
             auth,
+            mode: self.conn_mode,
         })
+    }
+
+    /// iroh 模式的 relay/令牌：全局设置（设置 › 通用 › 网络）读取；
+    /// 空 → None = n0 公共设施。主窗口实体不可达时同样回退 n0。
+    fn iroh_transport(&self, cx: &App) -> Transport {
+        let (relay, token) = self
+            .main
+            .upgrade()
+            .map(|ui| crate::db::iroh_global(&ui.read(cx).db))
+            .unwrap_or((None, None));
+        Transport::Iroh { relay, token }
     }
 
     /// 连接/测试用参数（比保存严格：用户名与密钥格式必校）。
     fn collect_params(&self, cx: &App) -> Result<ConnectParams, String> {
-        let host = self.host_f.read(cx).value();
-        if host.trim().is_empty() {
+        let host = self.addr_value(cx);
+        if host.is_empty() {
             return Err(crate::i18n::t(cx, crate::i18n::Tr::ErrHostEmpty).into());
         }
-        let port: u16 = self
-            .port_f
-            .read(cx)
-            .value()
-            .trim()
-            .parse()
-            .map_err(|_| crate::i18n::t(cx, crate::i18n::Tr::ErrPortRange).to_string())?;
+        let (port, transport) = match self.conn_mode {
+            ConnectMode::Ip => {
+                let port: u16 = self
+                    .port_f
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .parse()
+                    .map_err(|_| crate::i18n::t(cx, crate::i18n::Tr::ErrPortRange).to_string())?;
+                (port, Transport::Tcp)
+            }
+            ConnectMode::Iroh => {
+                if !is_node_id(&host) {
+                    return Err(crate::i18n::t(cx, crate::i18n::Tr::ErrNodeId).into());
+                }
+                (0, self.iroh_transport(cx))
+            }
+        };
         let username = self.user_f.read(cx).value();
         if username.trim().is_empty() {
             return Err(crate::i18n::t(cx, crate::i18n::Tr::ErrUserEmpty).into());
@@ -492,8 +569,14 @@ impl ServiceEditForm {
             auth,
             cols: 100,
             rows: 30,
+            transport,
         })
     }
+}
+
+/// NodeID 合法性：64 位十六进制。
+fn is_node_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 impl Render for ServiceEditForm {
@@ -536,8 +619,68 @@ impl Render for ServiceEditForm {
                     .child(div().flex_1().min_w_0().child(field(&self.alias_f)))
                     .child(self.icon_square(cx)),
             )
-                .child(kit_form::labeled_row(tr(crate::i18n::Tr::LabelHost), field(&self.host_f), kit))
-                .child(kit_form::labeled_row(tr(crate::i18n::Tr::LabelPort), field(&self.port_f), kit))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(div().w(px(72.)).flex_none().text_color(rgb(pal.muted)).child(tr(crate::i18n::Tr::LabelConnMode)))
+                        .child(kit_form::segmented(
+                            "conn-mode",
+                            &[
+                                (tr(crate::i18n::Tr::ConnModeIp), ConnectMode::Ip),
+                                (tr(crate::i18n::Tr::ConnModeIroh), ConnectMode::Iroh),
+                            ],
+                            self.conn_mode,
+                            kit,
+                            cx,
+                            |this, mode, _window, cx| {
+                                if this.conn_mode != mode {
+                                    // 地址值在单/多行字段间搬运，切换后无需重贴。
+                                    match mode {
+                                        ConnectMode::Ip => {
+                                            let v = this.node_f.read(cx).value();
+                                            this.host_f.update(cx, |f, cx| f.set_value(v.trim().to_string(), cx));
+                                        }
+                                        ConnectMode::Iroh => {
+                                            let v = this.host_f.read(cx).value();
+                                            this.node_f.update(cx, |f, cx| f.set_value(v, cx));
+                                        }
+                                    }
+                                    this.conn_mode = mode;
+                                }
+                                cx.notify();
+                            },
+                        )),
+                )
+                .child(match self.conn_mode {
+                    // 主机名单行；NodeID（64 hex 单行放不下）多行 + 自动换行。
+                    ConnectMode::Ip => kit_form::labeled_row(
+                        tr(crate::i18n::Tr::LabelHost),
+                        field(&self.host_f),
+                        kit,
+                    )
+                    .into_any_element(),
+                    ConnectMode::Iroh => kit_form::labeled_block(
+                        tr(crate::i18n::Tr::LabelNodeId),
+                        TextAreaField::new(self.node_f.clone()).theme(kit),
+                        kit,
+                    )
+                    .into_any_element(),
+                })
+                .children(match self.conn_mode {
+                    ConnectMode::Ip => vec![
+                        kit_form::labeled_row(tr(crate::i18n::Tr::LabelPort), field(&self.port_f), kit)
+                            .into_any_element(),
+                    ],
+                    ConnectMode::Iroh => vec![
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(pal.dim))
+                            .child(tr(crate::i18n::Tr::IrohFormHint))
+                            .into_any_element(),
+                    ],
+                })
                 .child(kit_form::labeled_row(tr(crate::i18n::Tr::LabelUsername), field(&self.user_f), kit))
                 .child(
                     div()

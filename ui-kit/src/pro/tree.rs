@@ -98,6 +98,11 @@ pub struct TreeNodeData {
     pub suffix: Option<String>,
     /// 行尾信息溢出省略模式（默认尾部省略）。
     pub suffix_ellipsis: EllipsisMode,
+    /// 第二行文本（**详细模式**渲染为两行行；None = 单行）。与 suffix 并存：
+    /// 简洁模式显示行尾 suffix，详细模式改为第二行 subtitle。
+    pub subtitle: Option<String>,
+    /// 第一行行尾徽章（带边框小框，如 "2C 4G 60G"；仅详细模式渲染）。
+    pub badge: Option<String>,
     /// 状态点颜色（行尾信息前的小圆点；None = 不画）。
     pub dot: Option<u32>,
     pub colors: NodeColors,
@@ -118,6 +123,8 @@ impl TreeNodeData {
             icon_open: None,
             suffix: None,
             suffix_ellipsis: EllipsisMode::default(),
+            subtitle: None,
+            badge: None,
             dot: None,
             colors: NodeColors::default(),
             children: Vec::new(),
@@ -348,6 +355,8 @@ pub struct TreeState {
     theme: Theme,
     row_h: f32,
     indent: f32,
+    /// 详细模式：带 subtitle 的节点渲染两行行（行 1 标题+徽章 / 行 2 副标题）。
+    detail: bool,
     /// 首次渲染播种初始展开后置位。
     seeded: bool,
 }
@@ -368,8 +377,55 @@ impl TreeState {
             theme: Theme::DARK,
             row_h: 26.,
             indent: 14.,
+            detail: false,
             seeded: false,
         }
+    }
+
+    /// 简洁/详细模式切换（详细 = 带 subtitle 的节点两行渲染）。
+    pub fn set_detail(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.detail = on;
+        cx.notify();
+    }
+
+    pub fn is_detail(&self) -> bool {
+        self.detail
+    }
+
+    /// 展开全部分组节点。
+    pub fn expand_all(&mut self, cx: &mut Context<Self>) {
+        fn walk(nodes: &[TreeNodeData], out: &mut HashSet<usize>) {
+            for n in nodes {
+                if n.kind == RowKind::Group {
+                    out.insert(n.id);
+                }
+                walk(&n.children, out);
+            }
+        }
+        let mut ids = HashSet::new();
+        walk(&self.nodes, &mut ids);
+        self.expanded = ids;
+        self.seeded = true;
+        cx.notify();
+    }
+
+    /// 收缩全部：只保留最外层分组展开（深度 0 的 Group）。
+    pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        fn walk(nodes: &[TreeNodeData], depth: usize, out: &mut HashSet<usize>) {
+            for n in nodes {
+                if n.kind == RowKind::Group {
+                    if depth == 0 {
+                        out.insert(n.id);
+                    }
+                    walk(&n.children, depth + 1, out);
+                }
+            }
+        }
+        let mut ids = HashSet::new();
+        walk(&self.nodes, 0, &mut ids);
+        self.expanded = ids;
+        self.seeded = true;
+        cx.notify();
     }
 
     /// 推入业务树数据（变更后调用；保留展开/选中状态）。
@@ -586,7 +642,12 @@ impl TreeState {
             .items_center()
             .gap_1()
             .cursor(gpui::CursorStyle::PointingHand)
-            .h(px(if is_editing { row_h + 4. } else { row_h }))
+            // 详细模式两行行（编辑态保持单行高度 +4）。
+            .h(px({
+                let two = self.detail && node.subtitle.is_some() && !is_editing;
+                let rh = if two { row_h * 2. - 8. } else { row_h };
+                if is_editing { rh + 4. } else { rh }
+            }))
             .pr_2()
             .mx_1()
             .rounded_md()
@@ -738,12 +799,27 @@ impl TreeState {
                 .child(node.label.clone())
                 .into_any_element()
         };
-        body = body.child(title);
-
-        // 状态点 + 行尾信息（弹性余量、右对齐、收缩省略）
-        if !is_editing {
+        if self.detail && node.subtitle.is_some() && !is_editing {
+            // —— 详细模式两行：行 1 = 标题（弹性省略）+ 状态点 + 徽章（带边框）；
+            // 行 2 = 副标题（弱化、尾部省略）。图标在行外侧垂直居中跨两行。——
+            let dim = if is_sel { theme.accent_dark } else { theme.dim };
+            let mut line1 = div().flex().w_full().min_w_0().items_center().gap_1();
+            line1 = line1.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .line_height(px(16.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .debug_selector(move || format!("tree-label-{id}"))
+                    .child(node.label.clone()),
+            );
             if let Some(dot) = node.dot {
-                body = body.child(
+                line1 = line1.child(
                     div()
                         .h(px(16.))
                         .flex()
@@ -752,36 +828,87 @@ impl TreeState {
                         .child(div().size(px(6.)).rounded_full().bg(rgb(dot))),
                 );
             }
-            if let Some(suffix) = node.suffix.clone() {
-                // 同一 label 的两种溢出显示：Tail=尾部省略（默认）；Middle=两头保留、中间 …。
-                let color = rgb(if is_sel { theme.accent_dark } else { theme.dim });
-                let suffix_el: AnyElement = match node.suffix_ellipsis {
-                    EllipsisMode::Tail => div()
-                        .flex_1()
-                        .min_w_0()
-                        .h(px(16.))
+            if let Some(badge) = node.badge.clone() {
+                let bc = if is_sel { theme.accent_dark } else { theme.border };
+                let tc = if is_sel { theme.accent_dark } else { theme.muted };
+                line1 = line1.child(
+                    div()
+                        .flex_none()
+                        .h(px(14.))
+                        .px(px(4.))
                         .flex()
                         .items_center()
-                        .justify_end()
-                        .line_height(px(16.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_size(px(10.))
-                        .text_color(color)
-                        .child(suffix)
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(bc))
+                        .text_size(px(9.5))
+                        .line_height(px(14.))
+                        .text_color(rgb(tc))
+                        .child(badge),
+                );
+            }
+            let line2 = div()
+                .w_full()
+                .min_w_0()
+                .h(px(14.))
+                .flex()
+                .items_center()
+                .line_height(px(14.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(10.))
+                .text_color(rgb(dim))
+                .child(node.subtitle.clone().unwrap_or_default());
+            body = body.child(
+                div().flex().flex_col().flex_1().min_w_0().gap(px(1.)).child(line1).child(line2),
+            );
+        } else {
+            body = body.child(title);
+
+            // 状态点 + 行尾信息（弹性余量、右对齐、收缩省略）
+            if !is_editing {
+                if let Some(dot) = node.dot {
+                    body = body.child(
+                        div()
+                            .h(px(16.))
+                            .flex()
+                            .items_center()
+                            .flex_none()
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(dot))),
+                    );
+                }
+                if let Some(suffix) = node.suffix.clone() {
+                    // 同一 label 的两种溢出显示：Tail=尾部省略（默认）；Middle=两头保留、中间 …。
+                    let color = rgb(if is_sel { theme.accent_dark } else { theme.dim });
+                    let suffix_el: AnyElement = match node.suffix_ellipsis {
+                        EllipsisMode::Tail => div()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .line_height(px(16.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(10.))
+                            .text_color(color)
+                            .child(suffix)
+                            .into_any_element(),
+                        EllipsisMode::Middle => MiddleLabel {
+                            text: suffix.into(),
+                            font_size: px(10.),
+                            color: color.into(),
+                            line_h: px(16.),
+                        }
                         .into_any_element(),
-                    EllipsisMode::Middle => MiddleLabel {
-                        text: suffix.into(),
-                        font_size: px(10.),
-                        color: color.into(),
-                        line_h: px(16.),
-                    }
-                    .into_any_element(),
-                };
-                body = body.child(suffix_el);
-            } else {
-                body = body.child(div().flex_1());
+                    };
+                    body = body.child(suffix_el);
+                } else {
+                    body = body.child(div().flex_1());
+                }
             }
         }
 

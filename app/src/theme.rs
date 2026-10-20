@@ -630,6 +630,15 @@ pub fn fmt_duration(loc: crate::i18n::Locale, secs: u64) -> String {
     }
 }
 
+/// 连接日志的相对时间戳：`+85ms` / `+1.4s`。
+pub fn fmt_step_ms(ms: u32) -> String {
+    if ms >= 1000 {
+        format!("+{}.{:01}s", ms / 1000, (ms % 1000) / 100)
+    } else {
+        format!("+{ms}ms")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

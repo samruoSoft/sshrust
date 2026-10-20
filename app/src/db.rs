@@ -22,12 +22,33 @@ pub const ROOT_COMMANDS: i64 = -2;
 /// 仅用于展开集持久化的 id 空间映射，不对应任何落库节点）。
 pub const ROOT_SERVER_CMDS: i64 = -3;
 
+/// 连接方式：IP 直连（host:port）或 iroh P2P（host 存 NodeID，port 恒 0）。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConnectMode {
+    #[default]
+    Ip,
+    Iroh,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ServerData {
+    /// Ip 模式 = 主机名/IP；Iroh 模式 = 目标 agent 的 NodeID（64 hex）。
     pub host: String,
+    /// Iroh 模式未用（恒 0）。
     pub port: u16,
     pub username: String,
     pub auth: StoredAuth,
+    #[serde(default)]
+    pub mode: ConnectMode,
+    /// Iroh：自建 relay URL（空 = n0 公共设施）。
+    #[serde(default)]
+    pub iroh_relay: String,
+    /// Iroh：relay 访问令牌（无鉴权的 relay 留空）。
+    #[serde(default)]
+    pub iroh_token: String,
+    /// 机器配置摘要（如 "2C 4G 60G"；登录后从系统信息捕获，展示在树行徽章）。
+    #[serde(default)]
+    pub spec: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -61,6 +82,10 @@ impl NodeKind {
                 port: 22,
                 username: String::new(),
                 auth: StoredAuth::Password(None),
+                mode: ConnectMode::Ip,
+                iroh_relay: String::new(),
+                iroh_token: String::new(),
+                spec: String::new(),
             })),
             "command" => NodeKind::Command(serde_json::from_str(data).unwrap_or_default()),
             _ => NodeKind::Folder,
@@ -179,6 +204,10 @@ impl Db {
                 port: e.port,
                 username: e.username,
                 auth: e.auth,
+                mode: ConnectMode::Ip,
+                iroh_relay: String::new(),
+                iroh_token: String::new(),
+                spec: String::new(),
             };
             let _ = self.insert_raw(NewNode {
                 parent: ROOT_SERVERS,
@@ -455,6 +484,52 @@ impl Db {
     }
 }
 
+// ---------- iroh 全局配置（P2P 中继；原按服务器配置已迁全局） ----------
+
+/// settings 键：全局 iroh relay URL（空/缺省 = n0 公共设施）。
+pub const SETTING_IROH_RELAY: &str = "iroh.relay";
+/// settings 键：全局 iroh relay 访问令牌（无鉴权 relay 留空）。
+pub const SETTING_IROH_TOKEN: &str = "iroh.token";
+/// 迁移完成标记（旧版按服务器存的 relay/令牌 → 全局，只跑一次）。
+const SETTING_IROH_MIGRATED: &str = "iroh.global.migrated";
+
+/// 全局 iroh relay/令牌（空串 → None = n0 公共设施）。
+pub fn iroh_global(db: &Db) -> (Option<String>, Option<String>) {
+    let pick = |key: &str| {
+        db.get_setting(key)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    (pick(SETTING_IROH_RELAY), pick(SETTING_IROH_TOKEN))
+}
+
+/// 旧版 relay/令牌按服务器节点存放；迁到全局设置（首个非空值，只跑一次，
+/// 已有全局值不覆盖）。AppUi 启动时调用。
+pub fn migrate_iroh_to_global(db: &mut Db) {
+    if db.get_setting(SETTING_IROH_MIGRATED).as_deref() == Some("1") {
+        return;
+    }
+    let mut relay: Option<String> = None;
+    let mut token: Option<String> = None;
+    for n in &db.nodes {
+        if let NodeKind::Server(d) = &n.kind {
+            if relay.is_none() && !d.iroh_relay.trim().is_empty() {
+                relay = Some(d.iroh_relay.trim().to_string());
+            }
+            if token.is_none() && !d.iroh_token.trim().is_empty() {
+                token = Some(d.iroh_token.trim().to_string());
+            }
+        }
+    }
+    if let Some(r) = relay {
+        db.set_setting(SETTING_IROH_RELAY, &r);
+    }
+    if let Some(t) = token {
+        db.set_setting(SETTING_IROH_TOKEN, &t);
+    }
+    db.set_setting(SETTING_IROH_MIGRATED, "1");
+}
+
 /// 节点类型 → data 列的 JSON 载荷。
 fn kind_payload(kind: &NodeKind) -> String {
     match kind {
@@ -509,6 +584,10 @@ mod tests {
                 port: 22,
                 username: "root".into(),
                 auth: StoredAuth::Password(None),
+                mode: ConnectMode::Ip,
+                iroh_relay: String::new(),
+                iroh_token: String::new(),
+                spec: String::new(),
             }),
             name: "web".into(),
         });
@@ -531,6 +610,40 @@ mod tests {
         assert_eq!(db.get_setting("k").as_deref(), Some("120"));
     }
 
+    /// relay/令牌全局化迁移：首个非空服务器值迁入全局；标记置位后不再重复跑
+    ///（用户随后清空全局不会被旧值回填）。
+    #[test]
+    fn iroh_settings_migrate_once() {
+        let mut db = mem_db();
+        db.insert(NewNode {
+            parent: ROOT_SERVERS,
+            kind: NodeKind::Server(ServerData {
+                host: "a".repeat(64),
+                port: 0,
+                username: "u".into(),
+                auth: StoredAuth::Password(None),
+                mode: ConnectMode::Iroh,
+                iroh_relay: "https://relay.example.com".into(),
+                iroh_token: "tok".into(),
+                spec: String::new(),
+            }),
+            name: "p2p".into(),
+        });
+        migrate_iroh_to_global(&mut db);
+        assert_eq!(
+            iroh_global(&db),
+            (
+                Some("https://relay.example.com".to_string()),
+                Some("tok".to_string())
+            )
+        );
+        // 标记已置位：清空全局后重跑不回填。
+        db.set_setting(SETTING_IROH_RELAY, "");
+        db.set_setting(SETTING_IROH_TOKEN, "");
+        migrate_iroh_to_global(&mut db);
+        assert_eq!(iroh_global(&db), (None, None));
+    }
+
     fn sample_tree(db: &mut Db) -> (i64, i64, i64) {
         // 连接/─web(server)；通用命令/─cmd1；web 下挂专用命令 scmd1。
         let server = db.insert(NewNode {
@@ -540,6 +653,10 @@ mod tests {
                 port: 22,
                 username: "root".into(),
                 auth: StoredAuth::Password(None),
+                mode: ConnectMode::Ip,
+                iroh_relay: String::new(),
+                iroh_token: String::new(),
+                spec: String::new(),
             }),
             name: "web".into(),
         });
@@ -576,6 +693,10 @@ mod tests {
                 port: 22,
                 username: "root".into(),
                 auth: StoredAuth::Password(None),
+                mode: ConnectMode::Ip,
+                iroh_relay: String::new(),
+                iroh_token: String::new(),
+                spec: String::new(),
             }),
             name: "db".into(),
         });
@@ -614,6 +735,10 @@ mod tests {
                 port: 22,
                 username: "root".into(),
                 auth: StoredAuth::Password(None),
+                mode: ConnectMode::Ip,
+                iroh_relay: String::new(),
+                iroh_token: String::new(),
+                spec: String::new(),
             }),
             name: "old".into(),
         });
@@ -625,6 +750,10 @@ mod tests {
                 port: 2222,
                 username: "admin".into(),
                 auth: StoredAuth::Key { key: "-----BEGIN OPENSSH PRIVATE KEY-----".into(), passphrase: None },
+                mode: ConnectMode::Ip,
+                iroh_relay: String::new(),
+                iroh_token: String::new(),
+                spec: String::new(),
             }),
         );
         // 仍是同一节点（数量不变、id 不变、parent/sort 保留），内容已替换。
@@ -638,6 +767,7 @@ mod tests {
             d.auth,
             StoredAuth::Key { key: "-----BEGIN OPENSSH PRIVATE KEY-----".into(), passphrase: None }
         );
+        assert_eq!(d.mode, ConnectMode::Ip);
     }
 
     /// 旧版 Key{path} 数据：能读到文件时迁移为内容，读不到时保留原值不丢节点。

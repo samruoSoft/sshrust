@@ -6,13 +6,20 @@
 //! 目录面板链路支持：`cd <dir>` 更新模拟 cwd 并回发 OSC 7；
 //! exec 通道支持 `pwd` / `ls -la -- <path>`（固化输出）与系统信息探针
 //! （`@@` 分节命令，合成随时间波动的 /proc 计数器）。
+//!
+//! SFTP 支持：`sftp` 子系统通道交给 russh-sftp server（内存文件系统，
+//! canned 只读层 + 动态写入层，跨连接共享——上传后 ls 可见、可下载回读）。
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use russh::keys::ssh_key::Algorithm;
 use russh::server::{self, Auth, Session as ServerSession};
 use russh::ChannelId;
+use russh_sftp::protocol::{
+    Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
+};
 
 pub const MOCK_USER: &str = "test";
 pub const MOCK_PASS: &str = "test";
@@ -74,10 +81,15 @@ pub async fn spawn() -> anyhow::Result<MockServer> {
     Ok(MockServer { port, shutdown: shutdown_tx })
 }
 
-/// 每连接一个 handler 实例，持有 shell 行缓冲。
+/// 每连接一个 handler，持有 shell 行缓冲与通道表。
 #[derive(Default)]
 struct MockShellHandler {
     shell: Option<ShellState>,
+    /// channel_open 时登记的通道对象：subsystem(sftp) 要消费它的 ChannelStream；
+    /// shell/exec 通道在对应请求到达时移除（数据走 Handler::data 回调）。
+    channels: HashMap<ChannelId, russh::Channel<russh::server::Msg>>,
+    /// 已交给 russh-sftp server 的通道：Handler::data 需让路（数据经 ChannelStream 投递）。
+    sftp_channels: HashSet<ChannelId>,
 }
 
 struct ShellState {
@@ -91,10 +103,13 @@ impl server::Handler for MockShellHandler {
 
     async fn channel_open_session(
         &mut self,
-        _channel: russh::Channel<russh::server::Msg>,
+        channel: russh::Channel<russh::server::Msg>,
         reply: russh::server::ChannelOpenHandle,
         _session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        // 登记通道对象：sftp 子系统要用它的 ChannelStream；
+        // shell/exec 路径在各自请求到达时移除（数据走 data 回调）。
+        self.channels.insert(channel.id(), channel);
         reply.accept().await;
         Ok(())
     }
@@ -140,9 +155,29 @@ impl server::Handler for MockShellHandler {
         channel: ChannelId,
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        self.channels.remove(&channel);
         session.channel_success(channel)?;
         session.data(channel, BANNER)?;
         self.shell = Some(ShellState { line: Vec::new(), cwd: MOCK_HOME.into() });
+        Ok(())
+    }
+
+    /// sftp 子系统：通道对象转 ChannelStream 交给 russh-sftp server（内部自起任务）。
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut ServerSession,
+    ) -> Result<(), Self::Error> {
+        if name == "sftp" {
+            if let Some(ch) = self.channels.remove(&channel) {
+                self.sftp_channels.insert(channel);
+                session.channel_success(channel)?;
+                russh_sftp::server::run(ch.into_stream(), MockSftpHandler::default()).await;
+                return Ok(());
+            }
+        }
+        session.channel_failure(channel)?;
         Ok(())
     }
 
@@ -153,6 +188,7 @@ impl server::Handler for MockShellHandler {
         data: &[u8],
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        self.channels.remove(&channel);
         session.channel_success(channel)?;
         let command = String::from_utf8_lossy(data).into_owned();
         session.data(channel, exec_output(&command).into_bytes())?;
@@ -168,6 +204,10 @@ impl server::Handler for MockShellHandler {
         data: &[u8],
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
+        // sftp 通道：数据同时投递给 ChannelStream 与本回调，让路避免被当 shell 输入。
+        if self.sftp_channels.contains(&channel) {
+            return Ok(());
+        }
         let Some(shell) = &mut self.shell else {
             return Ok(());
         };
@@ -406,58 +446,499 @@ fn fmt_etime(secs: f64) -> String {
     }
 }
 
-/// 固化的 `ls -la` 输出（列格式与真实 ls 一致，供 app 解析链路复用）。
-fn listing_for(path: &str) -> String {
+// ---------- mock 文件系统（canned 只读层 + 动态写入层；ls 与 SFTP 同源） ----------
+
+/// canned 目录项：名字 + 目录/符号链接标记（文件大小按内容长度）。
+#[derive(Clone, Copy)]
+struct CE {
+    name: &'static str,
+    dir: bool,
+    link: Option<&'static str>,
+}
+
+const fn d(name: &'static str) -> CE {
+    CE { name, dir: true, link: None }
+}
+const fn f(name: &'static str) -> CE {
+    CE { name, dir: false, link: None }
+}
+const fn l(name: &'static str, target: &'static str) -> CE {
+    CE { name, dir: false, link: Some(target) }
+}
+
+const ROOT_ENTRIES: &[CE] = &[
+    d(".Recycle_bin"),
+    l("bin", "usr/bin"),
+    d("boot"),
+    d("cdrom"),
+    d("dev"),
+    d("etc"),
+    d("home"),
+    l("lib", "usr/lib"),
+    d("opt"),
+    d("proc"),
+    d("root"),
+    d("run"),
+    l("sbin", "usr/sbin"),
+    d("srv"),
+    d("sys"),
+    d("tmp"),
+    d("usr"),
+    d("var"),
+];
+const HOME_ENTRIES: &[CE] = &[d("projects"), f(".bashrc"), f("notes.txt"), l("latest", "projects")];
+const PROJECTS_ENTRIES: &[CE] = &[d("sshrust"), f("README.md")];
+const SSHRUST_ENTRIES: &[CE] = &[f("Cargo.toml"), d("src")];
+
+fn canned_dir(path: &str) -> Option<&'static [CE]> {
     match path {
-        "/" => concat!(
-            "total 72\n",
-            "drwx------  2 test test 4096 Oct 14 08:00 .Recycle_bin\n",
-            "lrwxrwxrwx  1 root root    7 Oct 14 08:00 bin -> usr/bin\n",
-            "drwxr-xr-x  2 root root 4096 Oct 14 08:00 boot\n",
-            "drwxr-xr-x  2 root root 4096 Oct 14 08:00 cdrom\n",
-            "drwxr-xr-x  2 root root 4096 Oct 14 08:00 dev\n",
-            "drwxr-xr-x 29 root root 4096 Oct 14 08:00 etc\n",
-            "drwxr-xr-x  3 test test 4096 Oct 14 08:00 home\n",
-            "lrwxrwxrwx  1 root root    7 Oct 14 08:00 lib -> usr/lib\n",
-            "drwxr-xr-x  2 root root 4096 Oct 14 08:00 opt\n",
-            "drwxr-xr-x  2 root root 4096 Oct 14 08:00 proc\n",
-            "drwx------  4 root test 4096 Oct 14 08:00 root\n",
-            "drwxr-xr-x  2 root root 4096 Oct 14 08:00 run\n",
-            "lrwxrwxrwx  1 root root    8 Oct 14 08:00 sbin -> usr/sbin\n",
-            "drwxr-xr-x  2 root root 4096 Oct 14 08:00 srv\n",
-            "drwxr-xr-x  2 root root 4096 Oct 14 08:00 sys\n",
-            "drwxrwxrwt  2 root test 4096 Oct 14 08:00 tmp\n",
-            "drwxr-xr-x 12 root root 4096 Oct 14 08:00 usr\n",
-            "drwxr-xr-x 11 root root 4096 Oct 14 08:00 var\n",
-        )
-        .into(),
-        MOCK_HOME => concat!(
-            "total 40\n",
-            "drwxr-xr-x  3 test test 4096 Oct 14 09:00 .\n",
-            "drwxr-xr-x  3 test test 4096 Oct 14 08:00 ..\n",
-            "drwxr-xr-x  2 test test 4096 Oct 14 09:00 projects\n",
-            "-rw-r--r--  1 test test  220 Oct  1 09:12 .bashrc\n",
-            "-rw-r--r--  1 test test  128 Sep 30 21:33 notes.txt\n",
-            "lrwxrwxrwx  1 test test    9 Oct 14 09:00 latest -> projects\n",
-        )
-        .into(),
-        "/home/test/projects" => concat!(
-            "total 8\n",
-            "drwxr-xr-x 3 test test 4096 Oct 14 09:00 .\n",
-            "drwxr-xr-x 3 test test 4096 Oct 14 08:00 ..\n",
-            "drwxr-xr-x 2 test test 4096 Oct 14 09:00 sshrust\n",
-            "-rw-r--r-- 1 test test  298 Oct 14 09:00 README.md\n",
-        )
-        .into(),
-        "/home/test/projects/sshrust" => concat!(
-            "total 16\n",
-            "drwxr-xr-x 2 test test 4096 Oct 14 09:00 .\n",
-            "drwxr-xr-x 3 test test 4096 Oct 14 09:00 ..\n",
-            "-rw-r--r-- 1 test test  198 Oct 14 09:00 Cargo.toml\n",
-            "drwxr-xr-x 2 test test 4096 Oct 14 09:00 src\n",
-        )
-        .into(),
-        _ => "total 0\n".into(),
+        "/" => Some(ROOT_ENTRIES),
+        MOCK_HOME => Some(HOME_ENTRIES),
+        "/home/test/projects" => Some(PROJECTS_ENTRIES),
+        "/home/test/projects/sshrust" => Some(SSHRUST_ENTRIES),
+        _ => None,
+    }
+}
+
+/// canned 文件内容（SFTP 下载演示与 stat 大小来源）。
+fn canned_file(path: &str) -> Option<&'static str> {
+    match path {
+        "/home/test/notes.txt" => Some(concat!(
+            "mock notes for sshrust download demo\n",
+            "the quick brown fox jumps over the lazy dog\n",
+            "0123456789 ABCDEF\n",
+            "tail line for byte alignment\n",
+        )),
+        "/home/test/.bashrc" => Some(concat!(
+            "# ~/.bashrc: sshrust mock shell init\n",
+            "# 输入任意命令回显；cd 移动模拟目录并回发 OSC 7。\n",
+            "export PS1='> '\n",
+            "export TERM=xterm-256color\n",
+            "alias ll='ls -alF'\n",
+            "alias la='ls -A'\n",
+            "alias l='ls -CF'\n",
+        )),
+        "/home/test/projects/README.md" => Some(concat!(
+            "# sshrust mock project\n",
+            "\n",
+            "演示用固化 README：目录面板/SFTP 传输链路的下载目标。\n",
+            "\n",
+            "- 多标签终端\n",
+            "- 远程目录同步\n",
+            "- 系统信息监控\n",
+            "- 进程面板\n",
+            "- SFTP 文件传输\n",
+        )),
+        "/home/test/projects/sshrust/Cargo.toml" => Some(concat!(
+            "[package]\n",
+            "name = \"mock-demo\"\n",
+            "version = \"0.1.0\"\n",
+            "edition = \"2021\"\n",
+            "\n",
+            "[dependencies]\n",
+            "russh = \"0.64.1\"\n",
+            "tokio = { version = \"1\", features = [\"full\"] }\n",
+        )),
+        _ => None,
+    }
+}
+
+/// 动态写入层：上传/写入的文件、mkdir 的目录、对 canned 的删除遮罩。
+/// 全局共享（跨连接），与 T0 探针锚定同款模式——演示模式上传后 ls 可见。
+#[derive(Default)]
+struct DynFs {
+    files: HashMap<String, Vec<u8>>,
+    dirs: HashSet<String>,
+    hidden: HashSet<String>,
+}
+
+static DYN_FS: std::sync::OnceLock<std::sync::Mutex<DynFs>> = std::sync::OnceLock::new();
+
+fn dyn_fs() -> &'static std::sync::Mutex<DynFs> {
+    DYN_FS.get_or_init(|| std::sync::Mutex::new(DynFs::default()))
+}
+
+fn join_path(dir: &str, name: &str) -> String {
+    if dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// 目录的直接子项（canned 未遮罩 + 动态层）；非目录返回 None。
+fn mock_entries(path: &str) -> Option<Vec<MockEntry>> {
+    let dyns = dyn_fs().lock().unwrap();
+    if canned_dir(path).is_none() && !dyns.dirs.contains(path) {
+        return None;
+    }
+    let mut out = Vec::new();
+    if let Some(ces) = canned_dir(path) {
+        for ce in ces {
+            let full = join_path(path, ce.name);
+            if dyns.hidden.contains(&full) {
+                continue;
+            }
+            let size = match ce.link {
+                Some(t) => t.len() as u64,
+                None if ce.dir => 4096,
+                None => canned_file(&full).map(|s| s.len() as u64).unwrap_or(0),
+            };
+            out.push(MockEntry {
+                name: ce.name.to_string(),
+                dir: ce.dir,
+                link: ce.link.map(str::to_string),
+                size,
+            });
+        }
+    }
+    for (p, content) in &dyns.files {
+        if parent_of(p).as_deref() == Some(path) {
+            out.push(MockEntry {
+                name: basename_of(p),
+                dir: false,
+                link: None,
+                size: content.len() as u64,
+            });
+        }
+    }
+    for p in &dyns.dirs {
+        if parent_of(p).as_deref() == Some(path) {
+            out.push(MockEntry {
+                name: basename_of(p),
+                dir: true,
+                link: None,
+                size: 4096,
+            });
+        }
+    }
+    Some(out)
+}
+
+struct MockEntry {
+    name: String,
+    dir: bool,
+    link: Option<String>,
+    size: u64,
+}
+
+fn parent_of(path: &str) -> Option<String> {
+    path.rsplit_once('/').map(|(p, _)| if p.is_empty() { "/".to_string() } else { p.to_string() })
+}
+
+fn basename_of(path: &str) -> String {
+    path.rsplit_once('/').map(|(_, n)| n.to_string()).unwrap_or_else(|| path.to_string())
+}
+
+fn mock_read(path: &str) -> Option<Vec<u8>> {
+    let dyns = dyn_fs().lock().unwrap();
+    if dyns.hidden.contains(path) {
+        return None;
+    }
+    if let Some(v) = dyns.files.get(path) {
+        return Some(v.clone());
+    }
+    drop(dyns);
+    canned_file(path).map(|s| s.as_bytes().to_vec())
+}
+
+fn mock_is_dir(path: &str) -> bool {
+    if canned_dir(path).is_some() {
+        return true;
+    }
+    dyn_fs().lock().unwrap().dirs.contains(path)
+}
+
+fn mock_link(path: &str) -> Option<String> {
+    let name = basename_of(path);
+    let parent = parent_of(path)?;
+    canned_dir(&parent)?.iter().find(|ce| ce.name == name).and_then(|ce| ce.link.map(str::to_string))
+}
+
+fn mock_exists(path: &str) -> bool {
+    mock_is_dir(path) || mock_read(path).is_some() || mock_link(path).is_some()
+}
+
+/// 固化的 `ls -la` 输出（列格式与真实 ls 一致，供 app 解析链路复用）；
+/// 与 SFTP readdir 同源（mock_entries），上传的动态文件随取随见。
+fn listing_for(path: &str) -> String {
+    let Some(entries) = mock_entries(path) else {
+        return "total 0\n".into();
+    };
+    let mut out = format!("total {}\n", entries.len() * 4);
+    out.push_str("drwxr-xr-x 1 test test     4096 Oct 14 09:00 .\n");
+    out.push_str("drwxr-xr-x 2 test test     4096 Oct 14 08:00 ..\n");
+    for e in entries {
+        let line = match &e.link {
+            Some(t) => format!(
+                "lrwxrwxrwx 1 test test {:>7} Oct 14 09:00 {} -> {}\n",
+                t.len(),
+                e.name,
+                t
+            ),
+            None if e.dir => format!("drwxr-xr-x 1 test test {:>7} Oct 14 09:00 {}\n", e.size, e.name),
+            None => format!("-rw-r--r-- 1 test test {:>7} Oct 14 09:00 {}\n", e.size, e.name),
+        };
+        out.push_str(&line);
+    }
+    out
+}
+
+// ---------- SFTP server（内存 FS 后端） ----------
+
+/// 每条 sftp 子系统连接一个实例：句柄表 + mock FS 统一视图。
+#[derive(Default)]
+struct MockSftpHandler {
+    /// handle → 打开的文件路径。
+    files: HashMap<String, String>,
+    /// handle → 目录路径（readdir 单批：首批返回、次批 EOF）。
+    dirs: HashMap<String, String>,
+    next: u32,
+}
+
+impl MockSftpHandler {
+    fn ok(id: u32) -> Status {
+        Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        }
+    }
+
+    fn attrs_file(size: u64) -> FileAttributes {
+        FileAttributes {
+            size: Some(size),
+            permissions: Some(0o100644),
+            user: Some("test".to_string()),
+            group: Some("test".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn attrs_dir() -> FileAttributes {
+        FileAttributes {
+            size: Some(4096),
+            permissions: Some(0o040755),
+            user: Some("test".to_string()),
+            group: Some("test".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn attrs_link(target_len: usize) -> FileAttributes {
+        FileAttributes {
+            size: Some(target_len as u64),
+            permissions: Some(0o120777),
+            user: Some("test".to_string()),
+            group: Some("test".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn attrs_of(path: &str) -> Option<FileAttributes> {
+        if let Some(t) = mock_link(path) {
+            return Some(Self::attrs_link(t.len()));
+        }
+        if mock_is_dir(path) {
+            return Some(Self::attrs_dir());
+        }
+        mock_read(path).map(|v| Self::attrs_file(v.len() as u64))
+    }
+}
+
+impl russh_sftp::server::Handler for MockSftpHandler {
+    type Error = StatusCode;
+
+    fn unimplemented(&self) -> Self::Error {
+        StatusCode::OpUnsupported
+    }
+
+    async fn init(
+        &mut self,
+        _version: u32,
+        _extensions: HashMap<String, String>,
+    ) -> Result<Version, Self::Error> {
+        Ok(Version::new())
+    }
+
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        pflags: OpenFlags,
+        _attrs: FileAttributes,
+    ) -> Result<Handle, Self::Error> {
+        if pflags.contains(OpenFlags::WRITE) {
+            let mut dyns = dyn_fs().lock().unwrap();
+            dyns.hidden.remove(&filename);
+            let entry = dyns
+                .files
+                .entry(filename.clone())
+                .or_insert_with(|| canned_file(&filename).map(|s| s.as_bytes().to_vec()).unwrap_or_default());
+            if pflags.contains(OpenFlags::TRUNCATE) {
+                entry.clear();
+            }
+        } else if !mock_exists(&filename) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        self.next += 1;
+        let handle = format!("mock-file-{}", self.next);
+        self.files.insert(handle.clone(), filename);
+        Ok(Handle { id, handle })
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
+        let Some(path) = self.files.get(&handle).cloned() else {
+            return Err(StatusCode::Failure);
+        };
+        let data = mock_read(&path).ok_or(StatusCode::NoSuchFile)?;
+        let off = offset as usize;
+        if off >= data.len() {
+            return Err(StatusCode::Eof);
+        }
+        let end = (off + len as usize).min(data.len());
+        Ok(Data { id, data: data[off..end].to_vec() })
+    }
+
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
+        let Some(path) = self.files.get(&handle).cloned() else {
+            return Err(StatusCode::Failure);
+        };
+        let mut dyns = dyn_fs().lock().unwrap();
+        dyns.hidden.remove(&path);
+        let file = dyns
+            .files
+            .entry(path.clone())
+            .or_insert_with(|| canned_file(&path).map(|s| s.as_bytes().to_vec()).unwrap_or_default());
+        let off = offset as usize;
+        let end = off + data.len();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[off..end].copy_from_slice(&data);
+        Ok(Self::ok(id))
+    }
+
+    async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+        self.files.remove(&handle);
+        self.dirs.remove(&handle);
+        Ok(Self::ok(id))
+    }
+
+    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+        let Some(path) = self.files.get(&handle) else {
+            return Err(StatusCode::Failure);
+        };
+        let size = mock_read(path).map(|v| v.len()).unwrap_or(0);
+        Ok(Attrs { id, attrs: Self::attrs_file(size as u64) })
+    }
+
+    async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
+        if !mock_is_dir(&path) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        self.next += 1;
+        let handle = format!("mock-dir-{}", self.next);
+        self.dirs.insert(handle.clone(), path);
+        Ok(Handle { id, handle })
+    }
+
+    async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+        let Some(path) = self.dirs.remove(&handle) else {
+            return Err(StatusCode::Failure);
+        };
+        let entries = mock_entries(&path).ok_or(StatusCode::NoSuchFile)?;
+        let files = entries
+            .into_iter()
+            .map(|e| {
+                let attrs = if let Some(t) = &e.link {
+                    Self::attrs_link(t.len())
+                } else if e.dir {
+                    Self::attrs_dir()
+                } else {
+                    Self::attrs_file(e.size)
+                };
+                File::new(e.name, attrs)
+            })
+            .collect();
+        Ok(Name { id, files })
+    }
+
+    async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        let attrs = Self::attrs_of(&path).ok_or(StatusCode::NoSuchFile)?;
+        Ok(Attrs { id, attrs })
+    }
+
+    async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        let attrs = Self::attrs_of(&path).ok_or(StatusCode::NoSuchFile)?;
+        Ok(Attrs { id, attrs })
+    }
+
+    async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        Ok(Name { id, files: vec![File::dummy(resolve_dir(MOCK_HOME, &path))] })
+    }
+
+    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        let mut dyns = dyn_fs().lock().unwrap();
+        if dyns.files.remove(&filename).is_some() {
+            return Ok(Self::ok(id));
+        }
+        if canned_file(&filename).is_some() || mock_link(&filename).is_some() {
+            dyns.hidden.insert(filename);
+            return Ok(Self::ok(id));
+        }
+        Err(StatusCode::NoSuchFile)
+    }
+
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        if mock_exists(&path) {
+            return Err(StatusCode::Failure);
+        }
+        dyn_fs().lock().unwrap().dirs.insert(path);
+        Ok(Self::ok(id))
+    }
+
+    async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+        if dyn_fs().lock().unwrap().dirs.remove(&path) {
+            Ok(Self::ok(id))
+        } else {
+            Err(StatusCode::NoSuchFile)
+        }
+    }
+
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, Self::Error> {
+        let Some(content) = mock_read(&oldpath) else {
+            return Err(StatusCode::NoSuchFile);
+        };
+        let mut dyns = dyn_fs().lock().unwrap();
+        dyns.files.insert(newpath, content);
+        if dyns.files.remove(&oldpath).is_none() {
+            dyns.hidden.insert(oldpath);
+        }
+        Ok(Self::ok(id))
     }
 }
 

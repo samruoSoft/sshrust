@@ -12,7 +12,7 @@ use gpui::{
 use crate::db::Db;
 use crate::theme;
 use ui_kit::base::button::{self as kit_button, ButtonKind, ButtonSize};
-use ui_kit::base::text_input::{InputField, InputSize, InputType, TextField};
+use ui_kit::base::text_input::{InputField, InputSize, InputType, TextField, TextFieldEvent};
 use ui_kit::pro::dialog;
 use ui_kit::pro::scroll_area;
 
@@ -91,11 +91,14 @@ pub fn normalize_font_size(v: Option<f32>) -> f32 {
     v.unwrap_or(FONT_SIZE_DEFAULT).clamp(FONT_SIZE_MIN, FONT_SIZE_MAX)
 }
 
-/// 设置窗左侧导航分组（树形路径「通用 › 系统」「外观 › 控制台」）。
+/// 设置窗左侧导航分组（树形路径「通用 › 系统」「通用 › 网络」「外观 › 控制台」）。
 /// 「系统」详情页含 语言 / 窗口（背景模糊）/ 界面主题 三节，节间分割线。
 /// 后续设置项在此追加：新条目 + 对应详情页。
 const NAV: &[(crate::i18n::Tr, &[crate::i18n::Tr])] = &[
-    (crate::i18n::Tr::NavGeneral, &[crate::i18n::Tr::NavSystem]),
+    (
+        crate::i18n::Tr::NavGeneral,
+        &[crate::i18n::Tr::NavSystem, crate::i18n::Tr::NavNetwork],
+    ),
     (
         crate::i18n::Tr::NavAppearance,
         &[crate::i18n::Tr::NavConsole],
@@ -106,12 +109,14 @@ const NAV: &[(crate::i18n::Tr, &[crate::i18n::Tr])] = &[
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Page {
     System,
+    Network,
     Console,
 }
 
 fn page_of(group: usize, item: usize) -> Option<Page> {
     match (group, item) {
         (0, 0) => Some(Page::System),
+        (0, 1) => Some(Page::Network),
         (1, 0) => Some(Page::Console),
         _ => None,
     }
@@ -153,6 +158,9 @@ pub struct SettingsView {
     bg_fx: theme::BgFx,
     /// 外部搜索引擎（chips 选中态；改动落库 + 事件同步主窗）。
     search_engine: crate::procs::SearchEngine,
+    /// 「网络」页：全局 iroh relay / 令牌输入。
+    relay_f: Entity<TextField>,
+    token_f: Entity<TextField>,
     /// 已应用到本设置窗的背景效果（render 对账：拖动时本窗即时预览）。
     applied_fx: theme::BgFx,
     name_f: Entity<TextField>,
@@ -220,6 +228,30 @@ impl SettingsView {
         let name_f = cx.new(|cx| {
             TextField::new(crate::i18n::t(cx, crate::i18n::Tr::PhTplName), InputType::Text, cx)
         });
+        // 「网络」页字段：从全局设置载入；Change 即时落库（SQLite 小写入，代价可忽略）。
+        let relay_f = cx.new(|cx| {
+            TextField::new("https://", InputType::Text, cx)
+        });
+        relay_f.update(cx, |f, cx| {
+            f.set_value(db.get_setting(crate::db::SETTING_IROH_RELAY).unwrap_or_default(), cx)
+        });
+        let token_f = cx.new(|cx| TextField::new("", InputType::Password, cx));
+        token_f.update(cx, |f, cx| {
+            f.set_value(db.get_setting(crate::db::SETTING_IROH_TOKEN).unwrap_or_default(), cx)
+        });
+        for (field, key) in [
+            (&relay_f, crate::db::SETTING_IROH_RELAY),
+            (&token_f, crate::db::SETTING_IROH_TOKEN),
+        ] {
+            let key = key.to_string();
+            cx.subscribe(field, move |this, field, ev, cx| {
+                if matches!(ev, TextFieldEvent::Change) {
+                    let v = field.read(cx).value();
+                    this.db.set_setting(&key, &v);
+                }
+            })
+            .detach();
+        }
         let scroll = cx.new(|_| scroll_area::ScrollAreaState::new(scroll_area::next_owner()));
         cx.observe(&scroll, |_, _, cx| cx.notify()).detach();
         let lang = crate::i18n::Lang::parse(
@@ -255,6 +287,8 @@ impl SettingsView {
             bg_fx,
             applied_fx: bg_fx,
             search_engine,
+            relay_f,
+            token_f,
             name_f,
             scroll,
         }
@@ -566,6 +600,68 @@ impl SettingsView {
                     .text_size(px(11.))
                     .text_color(rgb(pal.dim))
                     .child(crate::i18n::tl(loc, crate::i18n::Tr::SearchEngineHint)),
+            )
+    }
+
+    /// 「通用 › 网络」详情页：P2P 中继（iroh）——全局 relay URL / 令牌。
+    /// 输入即时落库（连接时按需读取，无需事件同步主窗）。
+    fn network_page(&self, pal: &theme::PalFx, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let loc = crate::i18n::current(cx);
+        let kit = pal.kit();
+        let field = |f: &Entity<TextField>| {
+            div()
+                .flex_1()
+                .max_w(px(360.))
+                .child(InputField::new(f.clone()).size(InputSize::Sm).theme(kit))
+        };
+        div()
+            .id("settings-network")
+            .flex()
+            .flex_col()
+            .gap_4()
+            .w_full()
+            .min_h(gpui::relative(1.))
+            .p_6()
+            .text_size(px(13.))
+            .child(Self::section_label(
+                crate::i18n::tl(loc, crate::i18n::Tr::SecP2pRelay),
+                pal,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .flex_none()
+                            .text_size(px(12.))
+                            .text_color(rgb(pal.muted))
+                            .child(crate::i18n::tl(loc, crate::i18n::Tr::LabelRelay)),
+                    )
+                    .child(field(&self.relay_f)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .flex_none()
+                            .text_size(px(12.))
+                            .text_color(rgb(pal.muted))
+                            .child(crate::i18n::tl(loc, crate::i18n::Tr::LabelRelayToken)),
+                    )
+                    .child(field(&self.token_f)),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(pal.dim))
+                    .child(crate::i18n::tl(loc, crate::i18n::Tr::NetSettingsHint)),
             )
     }
 }
@@ -926,6 +1022,7 @@ impl Render for SettingsView {
         // ----- 详情页内容（按导航选择） -----
         let body = match self.page {
             Page::System => self.system_page(&pal, cx),
+            Page::Network => self.network_page(&pal, cx),
             Page::Console => div()
                 .id("settings-body")
                 .flex()
@@ -1025,6 +1122,7 @@ impl Render for SettingsView {
         // ----- 右侧详情区（面包屑 + 滚动内容；面包屑随选中页与语言） -----
         let (crumb_group, crumb_item) = match self.page {
             Page::System => (crate::i18n::Tr::NavGeneral, crate::i18n::Tr::NavSystem),
+            Page::Network => (crate::i18n::Tr::NavGeneral, crate::i18n::Tr::NavNetwork),
             Page::Console => (crate::i18n::Tr::NavAppearance, crate::i18n::Tr::NavConsole),
         };
         let right = div()
