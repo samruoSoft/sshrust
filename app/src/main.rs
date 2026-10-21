@@ -130,6 +130,31 @@ fn main() {
                     .detach();
                 }
                 let _ = window;
+
+                // --debug-net-page：诊断用，启动即打开设置窗（SettingsView 构造
+                // 读同一参数直接落到网络页，字段链路有 bounds 日志）；
+                // 3.5s 后自动把界面语言切到英文（等效点击语言 chips），观测
+                // 「切换后布局塌陷」问题。
+                if std::env::args().any(|a| a == "--debug-net-page") {
+                    let root = root_entity.clone();
+                    cx.spawn(
+                        async move |_this: gpui::WeakEntity<AppUi>, cx: &mut gpui::AsyncApp| {
+                            let _ = root.update(cx, |ui, cx| ui.open_settings(cx));
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(3_500))
+                                .await;
+                            cx.update(|cx: &mut gpui::App| {
+                                // 诊断：自动切英文复现「切语言后输入框塌陷」路径
+                                // （对照组：同语言 set_global 不触发，已验证）。
+                                cx.set_global(crate::i18n::I18nGlobal(
+                                    crate::i18n::resolve(crate::i18n::Lang::En),
+                                ));
+                            })
+                            .ok();
+                        },
+                    )
+                    .detach();
+                }
             })
             .ok();
 

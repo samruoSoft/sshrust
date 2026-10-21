@@ -17,6 +17,8 @@ debug = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+# 依赖不带任何调试信息（要单步进依赖源码时临时改回 1）
+debug = false
 
 # agent 部署专用最小体积档（不影响 release：app 保留符号便于崩溃报告定位）。
 # 用法：cargo build --profile release-min --target aarch64-unknown-linux-musl -p sshrust-agent

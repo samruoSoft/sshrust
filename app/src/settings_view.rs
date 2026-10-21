@@ -262,6 +262,12 @@ impl SettingsView {
         let search_engine = crate::procs::SearchEngine::parse(
             &db.get_setting(crate::procs::SETTING_SEARCH_ENGINE).unwrap_or_default(),
         );
+        // --debug-net-page：诊断用，直接落到网络页（配合 main 的自动开窗）。
+        let page = if std::env::args().any(|a| a == "--debug-net-page") {
+            Page::Network
+        } else {
+            Page::Console
+        };
         // 语言切换：本窗（导航/分区/按钮）即时重绘；占位字一并更新。
         cx.observe_global::<crate::i18n::I18nGlobal>(|this, cx| {
             let ph = crate::i18n::t(cx, crate::i18n::Tr::PhTplName);
@@ -282,7 +288,7 @@ impl SettingsView {
             font_size,
             font_choices,
             // 默认仍落在控制台页（既有习惯；语言/窗口/主题在「通用 › 系统」页下）。
-            page: Page::Console,
+            page,
             lang,
             bg_fx,
             applied_fx: bg_fx,
@@ -575,6 +581,8 @@ impl SettingsView {
             )
             .child(
                 div()
+                    // 长文案可收缩，防英文测量宽撑破列协商（同网络页修复）。
+                    .min_w_0()
                     .text_size(px(11.))
                     .text_color(rgb(pal.dim))
                     .child(crate::i18n::tl(loc, crate::i18n::Tr::BgBlurHint)),
@@ -597,6 +605,8 @@ impl SettingsView {
             .child(engine_chips)
             .child(
                 div()
+                    // 长文案可收缩，防英文测量宽撑破列协商（同网络页修复）。
+                    .min_w_0()
                     .text_size(px(11.))
                     .text_color(rgb(pal.dim))
                     .child(crate::i18n::tl(loc, crate::i18n::Tr::SearchEngineHint)),
@@ -608,10 +618,11 @@ impl SettingsView {
     fn network_page(&self, pal: &theme::PalFx, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let loc = crate::i18n::current(cx);
         let kit = pal.kit();
-        let field = |f: &Entity<TextField>| {
+        let field = |f: &Entity<TextField>, name: &'static str| {
             div()
                 .flex_1()
                 .max_w(px(360.))
+                .debug_selector(move || name.to_string())
                 .child(InputField::new(f.clone()).size(InputSize::Sm).theme(kit))
         };
         div()
@@ -640,7 +651,7 @@ impl SettingsView {
                             .text_color(rgb(pal.muted))
                             .child(crate::i18n::tl(loc, crate::i18n::Tr::LabelRelay)),
                     )
-                    .child(field(&self.relay_f)),
+                    .child(field(&self.relay_f, "net-relay-field")),
             )
             .child(
                 div()
@@ -655,10 +666,14 @@ impl SettingsView {
                             .text_color(rgb(pal.muted))
                             .child(crate::i18n::tl(loc, crate::i18n::Tr::LabelRelayToken)),
                     )
-                    .child(field(&self.token_f)),
+                    .child(field(&self.token_f, "net-token-field")),
             )
             .child(
                 div()
+                    // min_w_0：长文案（英文 hint 单行测量宽超列宽）不得参与
+                    // 列的 min-content 撑宽，否则 flex 协商破裂——内部 w_full
+                    // 百分比解析失效，输入盒退化为内容固有宽（26px 小方块）。
+                    .min_w_0()
                     .text_size(px(11.))
                     .text_color(rgb(pal.dim))
                     .child(crate::i18n::tl(loc, crate::i18n::Tr::NetSettingsHint)),
@@ -1072,6 +1087,8 @@ impl Render for SettingsView {
                 .child(actions)
                 .child(
                     div()
+                        // 长文案可收缩，防英文测量宽撑破列协商（同网络页修复）。
+                        .min_w_0()
                         .text_size(px(11.))
                         .text_color(rgb(pal.dim))
                         .child(crate::i18n::tl(loc, crate::i18n::Tr::TplHint)),
@@ -1204,4 +1221,109 @@ pub fn open_settings(ui: &Entity<crate::app_ui::AppUi>, cx: &mut App) {
     );
     // 开窗建立的模糊视图需要按当前主题系列 tint（幂等）。
     ui_kit::platform::set_blur_tint(!theme::is_light(cx));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sandbox_home() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshrust_settings_{}_{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("HOME", dir) };
+    }
+
+    /// 复刻 DialogHost 无 footer 路径的宿主包装（真实设置窗的嵌入方式；
+    /// 窗口钉 780×672 = 设置窗规格宽 × 去原生标题栏后的客户区高）。
+    struct Host(Entity<SettingsView>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+                .id("dialog-host")
+                .w(px(780.))
+                .h(px(672.))
+                .relative()
+                .child(self.0.clone())
+        }
+    }
+
+    /// 网络页 relay/令牌字段须从全局设置载入（回归：实测中设置窗曾显示为空）。
+    /// gpui 测试并行跑且共享进程级 HOME——其他测试的 sandbox_home 可能中途换走
+    /// HOME，导致构造读到别人的空库；检测到被换（或值不符）即整轮重试。
+    #[gpui::test]
+    fn network_page_loads_global_iroh(cx: &mut gpui::TestAppContext) {
+        for _ in 0..5 {
+            sandbox_home();
+            let my_home = std::env::var("HOME").unwrap_or_default();
+            {
+                let mut db = Db::open();
+                db.set_setting(crate::db::SETTING_IROH_RELAY, "https://relay.example.com");
+                db.set_setting(crate::db::SETTING_IROH_TOKEN, "tok123");
+            }
+            let view = cx.new(|cx| SettingsView::new(cx));
+            let (_host, cx) = cx.add_window_view(|_w, _cx| Host(view.clone()));
+            cx.run_until_parked();
+            let raced =
+                std::env::var("HOME").map(|h| h != my_home).unwrap_or(true);
+            let (relay, token) = cx.update(|_w, app| {
+                view.update(app, |v, cx| {
+                    (v.relay_f.read(cx).value(), v.token_f.read(cx).value())
+                })
+            });
+            if raced {
+                continue;
+            }
+            assert_eq!(relay, "https://relay.example.com", "relay 字段应载入全局值");
+            assert_eq!(token, "tok123", "令牌字段应载入全局值");
+            // 布局：切到网络页后两个字段应占满行宽（上限 360），不得塌成小方块。
+            cx.update(|_w, app| {
+                view.update(app, |v, cx| {
+                    v.page = Page::Network;
+                    cx.notify();
+                });
+            });
+            cx.run_until_parked();
+            let rb = cx
+                .debug_bounds("net-relay-field")
+                .expect("relay 字段应有布局 bounds");
+            let tb = cx
+                .debug_bounds("net-token-field")
+                .expect("token 字段应有布局 bounds");
+            assert!(
+                f32::from(rb.size.width) > 200.,
+                "relay 输入框宽度塌陷: {rb:?}"
+            );
+            assert!(
+                f32::from(tb.size.width) > 200.,
+                "token 输入框宽度塌陷: {tb:?}"
+            );
+            // 内层 InputField 盒子（w_full 生效性）：默认语言下应与包装同宽。
+            let ib = cx
+                .debug_bounds("input-field-box")
+                .expect("InputField 盒子应有布局 bounds");
+            assert!(
+                f32::from(ib.size.width) > 200.,
+                "InputField 内盒宽度塌陷（默认语言）: {ib:?}"
+            );
+            // 切英文后重渲染：内盒不得塌陷（真机复现「切英文输入框变小方块」）。
+            cx.update(|_w, app| {
+                app.set_global(crate::i18n::I18nGlobal(crate::i18n::resolve(
+                    crate::i18n::Lang::En,
+                )));
+            });
+            cx.run_until_parked();
+            let ib_en = cx
+                .debug_bounds("input-field-box")
+                .expect("切英文后 InputField 盒子应有 bounds");
+            assert!(
+                f32::from(ib_en.size.width) > 200.,
+                "切英文后 InputField 内盒塌陷: {ib_en:?}（包装 bounds {rb:?}）"
+            );
+            return;
+        }
+        panic!("连续 5 轮均被并行测试换走 HOME，无法完成验证");
+    }
 }

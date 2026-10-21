@@ -2,17 +2,19 @@
 
 English | [简体中文](README_CN.md)
 
-An SSH server management app (Termius / XShell-like) built with Rust + [GPUI](https://github.com/longbridge/gpui).
+An SSH / P2P server management app (Termius / XShell-like) built with Rust + iroh +
+[GPUI](https://github.com/longbridge/gpui).
 
 Most SSH clients today force a trade-off. Polished GUI tools like Termius and XShell are
 subscription-based or gated by personal-use-only licenses, while the free alternatives are
 mostly Electron wrappers that drag a full Chromium runtime along just to draw a terminal —
 easily 150–300 MB of RAM before you've even connected anywhere. sshrust takes a different
-path: an all-native Rust stack (russh for the protocol, GPUI for the UI) that ships as a
-single ~24 MB executable and idles at ~86 MB of memory, while still delivering multi-tab
-terminals, grouped server management, remote file browsing, real-time system monitoring,
-a remote process panel, a snippet library — and NAT-traversing P2P connections to reach
-machines that have no public address.
+path: an all-native Rust stack (russh for the protocol, [iroh](https://iroh.computer) for
+P2P, GPUI for the UI) that ships as a single ~24 MB executable and idles at ~86 MB of
+memory, while still delivering multi-tab terminals, grouped server management, remote file
+browsing with SFTP transfers, real-time system monitoring, a remote process panel, a
+snippet library — and iroh-based P2P connections that reach devices inside a LAN even
+without a public IP, with no port forwarding or DDNS required.
 
 ## Screenshots
 
@@ -67,7 +69,7 @@ hundred MB.
 
 - **Session management**: server tree (groups / drag & drop / context-menu CRUD / inline
   rename), password or private-key auth (key content pass-through + alias management);
-  SQLite persistence (`~/.sshrust/sshrust.db`, auto-migrates the legacy hosts.json)
+  SQLite persistence
 - **Terminal**: multi-tab sessions, pop out / merge back tabs into standalone windows,
   collapsible three-pane layout, compact title bar; connecting tabs show a live
   per-stage log (resolve → handshake → auth → PTY) and stay identified by alias
@@ -75,7 +77,7 @@ hundred MB.
   QUIC hole punching, end-to-end encrypted); live path indicator (direct / relay / mixed)
   with measured round-trip latency, both endpoints' public IP & ISP, and automatic
   re-punching when stuck on relay. Configure once globally (Settings › General › Network);
-  requires the [sshrust-agent](#p2p--sshrust-agent) binary on the target machine
+  requires the [sshrust-agent](#p2p--sshrust-agent-nat-traversal-no-public-or-static-ip-needed) binary on the target machine
 - **Right tool panel**: remote directory (follows `cd` via OSC 7 + `ls -la` lazy loading +
   **SFTP file transfer**: upload/download via context menu or toolbar button, progress /
   speed / cancel, overwrite confirmation), system info (real-time CPU / memory / network /
@@ -88,29 +90,167 @@ hundred MB.
 - **Localization**: English & Chinese, switching instantly
 - **Node icons**: embedded Lucide SVGs (317 icons; 42-category picker + keyword auto-matching)
 
-## P2P & sshrust-agent
+## P2P & sshrust-agent (NAT traversal, no public or static IP needed)
 
 To connect to a machine without a public address (home NAS, lab box behind campus NAT,
-cloud-free environments), sshrust pairs with **sshrust-agent** — a tiny bridge that runs
-on the target machine, joins the iroh network (relay rendezvous + QUIC hole punching) and
-forwards inbound streams to the local sshd.
+a Pi on mobile broadband), sshrust pairs with **sshrust-agent** — a tiny closed-source
+bridge distributed as prebuilt static binaries (Linux `aarch64` / `x86_64`, zero
+dependencies) from the [Releases](https://github.com/samruoSoft/sshrust/releases) page.
+The agent joins the iroh network with a stable NodeID (an ed25519 public key) and
+bridges every inbound QUIC stream to the local sshd:
 
-- The agent is **closed-source** and distributed as prebuilt static binaries
-  (Linux `aarch64` / `x86_64`, zero dependencies) from the
-  [Releases](https://github.com/samruoSoft/sshrust/releases) page.
-- Install on the target machine:
+```
+ you                                              the device
+┌──────────────┐    relay — rendezvous + fallback ┌──────────────┐  loopback ┌──────┐
+│    sshrust   │◄════════ TLS over TCP 443 ══════►│ sshrust-agent│◄─────────►│ sshd │
+│   (client)   │◄─ ─ ─ QUIC/UDP hole punch ─ ─ ─►│  (systemd)   │           └──────┘
+└──────────────┘      direct path, preferred     └──────────────┘
+```
 
-  ```bash
-  # pick the binary for the arch, then:
-  sudo mv sshrust-agent /usr/local/bin/sshrust-agent
-  sudo env IROH_RELAY=https://your-relay IROH_RELAY_TOKEN=...        /usr/local/bin/sshrust-agent install   # systemd service, enabled at boot
-  sudo sshrust-agent id                       # prints the fixed NodeID
-  ```
+The SSH layer rides on this transport unchanged: username / password / key are the
+device's own SSH credentials, and every panel (terminal, SFTP transfer, system info,
+processes) works over a P2P session. Traffic is end-to-end encrypted between the two
+endpoints — whichever relay is in use only ever sees ciphertext. The session panel
+tracks the live path (**Direct** / **Relay** / **Mixed** = direct selected with the
+relay kept as hot standby), a measured round-trip latency, and both endpoints' public
+egress IP; a session that starts relayed keeps re-attempting the hole punch
+automatically, and a dropped direct path falls back to the relay without losing the
+SSH session.
 
-- In the app: *Settings › General › Network* sets the relay/token once (leave empty to use
-  the free public n0 infrastructure), then add a server in **P2P** mode with its NodeID.
-- Security: traffic is end-to-end encrypted between the two endpoints (identity = the
-  NodeID's key pair); relays only ever see ciphertext and metadata.
+Two ways to run it — pick one per deployment:
+
+### Option A — n0 public infrastructure (zero setup)
+
+Leave the relay setting empty everywhere (agent installed without relay env vars,
+app settings empty). Rendezvous, fallback relaying and address discovery all use
+n0's free public services — nothing to deploy. Two caveats:
+
+- n0's relays are shared and hosted overseas: from mainland China we measured
+  ~350–550 ms relayed RTT (from elsewhere they are usually fast).
+- With iroh's public defaults, published discovery records carry only the relay
+  address and no direct IP candidates — connections work from anywhere, but they
+  effectively stay relayed. Direct paths are a self-hosted-mode feature in this
+  release (see the comparison below).
+
+### Option B — self-hosting a relay (Docker)
+
+A relay wants a small VPS with a public IP and a DNS name, with **TCP 80/443 and
+UDP 7842** open — in the cloud security group *and* the host firewall. UDP is the one
+everybody misses: when it is blocked nothing errors out, hole punching just quietly
+degrades.
+
+`/opt/iroh-relay/iroh-relay.toml`:
+
+```toml
+# Top-level keys must come before any [section].
+# Lets endpoints learn their public address from *your* relay (QUIC, UDP 7842)
+# instead of borrowing n0's mirrors.
+enable_quic_addr_discovery = true
+
+[tls]
+hostname  = "relay.example.com"
+cert_mode = "LetsEncrypt"        # issue & renew automatically; needs TCP 80 + 443
+cert_dir  = "/certs"
+contact   = "you@example.com"
+
+[access]
+# Only clients presenting this token may use the relay (generate: openssl rand -hex 32)
+shared_token = ["0123abcd…"]
+```
+
+```bash
+docker run -d --name iroh-relay --restart unless-stopped \
+  -p 80:80 -p 443:443 -p 7842:7842/udp \
+  -v /opt/iroh-relay/iroh-relay.toml:/iroh-relay.toml:ro \
+  -v /opt/iroh-relay/certs:/certs \
+  n0computer/iroh-relay:v1.3.0 -c /iroh-relay.toml
+
+curl https://relay.example.com/healthz    # expect {"status":"ok",…}
+```
+
+Notes:
+
+- The relay must serve TLS itself. If nginx already owns 443, give the relay its own
+  port (`https_bind_addr = "[::]:9443"`) and reverse-proxy to it with
+  `proxy_pass https://127.0.0.1:9443` — keep the `https://` scheme! — plus WebSocket
+  upgrade headers; UDP 7842 bypasses the proxy entirely.
+- Already holding certificates for that host (certbot, hosting panel)? Use
+  `cert_mode = "Reloading"` with `manual_cert_path` / `manual_key_path`; the relay
+  hot-reloads them on renewal.
+- If the server's UDP inbound is permanently blocked, drop `enable_quic_addr_discovery`
+  and set `IROH_QAD_RELAY` on the agent (see below) — sshrust borrows n0's relays as
+  discovery mirrors automatically.
+- Relay and client versions do not have to match exactly — relays are interoperable;
+  any recent 1.x image is fine.
+
+### Deploying sshrust-agent (device side)
+
+```bash
+scp sshrust-agent pi@device:/tmp/ && ssh pi@device
+sudo mv /tmp/sshrust-agent /usr/local/bin/sshrust-agent   # never install from /tmp (wiped on boot)
+sudo chmod +x /usr/local/bin/sshrust-agent
+
+ss -tlnp | grep ssh   # which port does sshd actually listen on? (the agent bridges to it)
+
+# Option A (n0): no env needed
+sudo sshrust-agent install
+
+# Option B (your relay — env given here is captured into the systemd unit):
+sudo env IROH_RELAY=https://relay.example.com \
+         IROH_RELAY_TOKEN=0123abcd… \
+         SSHRUST_AGENT_SSH_ADDR=127.0.0.1:2222 \
+         sshrust-agent install
+#   SSHRUST_AGENT_SSH_ADDR: only if sshd is not on 22 (from the ss check above)
+#   IROH_QAD_RELAY=https://usw1-1.relay.n0.iroh.link: only if your relay's UDP 7842
+#     is blocked — an n0 relay reachable from both ends, used purely for discovery
+
+sudo sshrust-agent id           # the NodeID you dial — stable across reboots
+journalctl -u sshrust-agent -f  # live logs: version, NodeID, QAD probe results
+```
+
+`install` writes a systemd unit (`Restart=always`, boot autostart), captures the
+current env into it and (re)starts the service. Changing relay / token / sshd port
+later means re-running `install` with the new env, or editing
+`/etc/systemd/system/sshrust-agent.service` followed by
+`systemctl restart sshrust-agent`. The identity key lives in
+`/var/lib/sshrust-agent/key`; `sshrust-agent getnewid` rotates it — the old NodeID
+stops working immediately, so update your server entries. Remove the service with
+`sudo sshrust-agent uninstall` (the key is kept).
+
+### Configuring the client
+
+1. *(Option B only)* Settings ‣ General ‣ Network — enter the relay URL and token
+   once; they apply to all P2P connections. Leave empty for n0.
+2. New server ‣ Connection: **P2P** — paste the agent's NodeID (64 hex characters).
+   Username / password / key are the device's own SSH credentials.
+3. Connect. The connecting tab logs every stage (iroh endpoint → relay rendezvous →
+   dial → QUIC stream → SSH handshake → auth → PTY); once open, the session-status
+   page tracks path, latency and both endpoints' egress.
+
+### n0 vs self-hosted relay
+
+|  | n0 public (default) | Self-hosted relay |
+| --- | --- | --- |
+| Setup | none | one Docker container on a public-IP host, ~10 min |
+| Relayed latency | shared overseas relays: ~350–550 ms measured from China | tens of ms with a nearby VPS (~50–60 ms measured) |
+| Direct path (hole punch) | effectively off — public defaults publish no IP candidates | on — ~10 ms measured between same-province broadband lines, relay kept as hot standby |
+| Content confidentiality | identical — end-to-end encrypted, the relay sees only ciphertext | identical |
+| Metadata (who↔who, timing) | visible to n0 | stays on your server |
+| Access control | open to everyone | `shared_token` — only your clients |
+| Availability | free, best-effort, no SLA | your uptime, your rules |
+
+Fine print worth knowing:
+
+- A bare NodeID must be discoverable somehow, so in **both** modes a signed address
+  record (NodeID → relay + public address) is published to n0's public DNS — standard
+  iroh behaviour. sshrust filters it down to the relay plus publicly routable IPs;
+  LAN addresses are never published.
+- Setting your own relay does not cut n0 off: n0's relays remain merged in as
+  address-discovery mirrors and backup relays, so connections survive your own relay
+  going down.
+- Direct vs relayed mostly matters for bulk throughput — interactive typing feels
+  similar at 10 ms and 50 ms, but large SFTP transfers are much faster over a direct
+  path.
 
 ## Project Structure
 

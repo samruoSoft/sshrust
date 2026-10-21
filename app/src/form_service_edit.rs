@@ -675,6 +675,10 @@ impl Render for ServiceEditForm {
                     ],
                     ConnectMode::Iroh => vec![
                         div()
+                            // 长文案须可收缩（见 settings_view 网络页同类修复）：
+                            // 英文单行测量宽超列宽会撑破 flex 协商，连带输入框
+                            // w_full 失效塌成小方块。
+                            .min_w_0()
                             .text_size(px(11.))
                             .text_color(rgb(pal.dim))
                             .child(tr(crate::i18n::Tr::IrohFormHint))

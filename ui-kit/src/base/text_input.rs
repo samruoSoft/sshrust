@@ -734,6 +734,7 @@ impl RenderOnce for InputField {
 
         let mut el = div()
             .id("input-field")
+            .debug_selector(|| "input-field-box".to_string())
             .flex()
             .items_center()
             .gap_2()

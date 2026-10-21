@@ -134,6 +134,9 @@ impl Db {
     pub fn open() -> Db {
         let path = Self::db_path();
         let conn = Connection::open(&path).expect("open sshrust.db");
+        // 多处短生命周期连接（设置窗/表单）与 AppUi 长连接并发读写；无 busy 超时的
+        // 瞬间锁冲突会让查询直接 Err（get_setting 的 .ok() 吞掉 → 静默读成空值）。
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(3_000));
         #[cfg(unix)]
         if let Some(dir) = path.parent() {
             use std::os::unix::fs::PermissionsExt;

@@ -64,10 +64,12 @@ impl Tooltip {
 impl Render for Tooltip {
     fn render(&mut self, _window: &mut gpui::Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let t = self.theme;
+        // 行高定死（gpui 默认 phi≈1.618 对多行小字偏疏），图标盒同高以对齐首行。
+        let line_h = (self.text_size * 1.45).ceil();
         div()
             .id("kit-tooltip")
             .flex()
-            .items_center()
+            .items_start()
             .gap_1_5()
             .px_2()
             .py_1()
@@ -79,15 +81,21 @@ impl Render for Tooltip {
             .border_color(rgb(t.border))
             .shadow_sm()
             .text_size(px(self.text_size))
+            .line_height(px(line_h))
+            .whitespace_normal()
             .text_color(rgb(t.text))
             .children(self.icon.as_ref().map(|p| {
-                gpui::svg()
-                    .path(p.clone())
-                    .size(px(self.text_size + 1.))
-                    .flex_none()
-                    .text_color(rgb(t.muted))
+                div().flex_none().h(px(line_h)).flex().items_center().child(
+                    gpui::svg()
+                        .path(p.clone())
+                        .size(px(self.text_size + 1.))
+                        .text_color(rgb(t.muted)),
+                )
             }))
-            .child(self.text.clone())
+            // gpui 以 MinContent 给 tooltip 做根布局，文字测量拿不到定宽就按整行算，
+            // 作为 flex 子项其 min-width:auto 即整行宽、拒绝收缩而溢出 max_w；
+            // 放开 min_w_0 后才会被夹成定宽，gpui 据此折行。
+            .child(div().min_w_0().child(self.text.clone()))
     }
 }
 
