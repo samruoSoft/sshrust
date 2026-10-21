@@ -2,6 +2,8 @@
 name = "sshrust-app"
 version = "0.1.1"
 edition = "2024"
+# Apache-2.0 + Commons Clause 无 SPDX 标识，指到仓库根 LICENSE（不发布 crates.io）
+license-file = "../LICENSE"
 
 [dependencies]
 sshrust-core = { path = "../core" }

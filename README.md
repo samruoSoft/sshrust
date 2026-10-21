@@ -285,3 +285,15 @@ russh 0.64 · russh-sftp 3.0 · iroh 1.3 (P2P transport) · gpui 0.2.2 · gpui-t
 cargo build --release -p sshrust-app    # artifact: target/release/sshrust-app
 # .app bundle + DMG: see scripts/package.sh
 ```
+
+## License
+
+The source code in this repository is licensed under **Apache-2.0 with the Commons
+Clause**: you are free to use, copy, modify and redistribute it for any purpose —
+including day-to-day use at a company — but you may **not Sell the Software**, i.e.
+provide it, or a product/service whose value derives substantially from it, to third
+parties for a fee or other consideration. See [LICENSE](LICENSE) for the exact wording.
+
+**sshrust-agent** is closed-source. Its prebuilt binaries are free to use together with
+sshrust and may not be redistributed, sold, or used to provide a paid service. For a
+commercial license, open a GitHub issue.

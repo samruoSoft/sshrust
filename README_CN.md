@@ -244,3 +244,12 @@ russh 0.64 · russh-sftp 3.0 · iroh 1.3（P2P 传输） · gpui 0.2.2 · gpui-t
 cargo build --release -p sshrust-app    # 产物 target/release/sshrust-app
 # .app bundle + DMG 见 scripts/package.sh
 ```
+
+## 许可证
+
+本仓库源码采用 **Apache-2.0 + Commons Clause**：任何人可自由使用、复制、修改与再分发
+（含公司内的日常使用），但**不得售卖本软件**——即以收费或其他对价向第三方提供本软件、
+或价值主要来源于本软件的产品/服务。确切措辞见 [LICENSE](LICENSE)。
+
+**sshrust-agent** 闭源：预编译二进制可随 sshrust 免费使用，不得再分发、售卖或用于提供
+收费服务。需要商业授权请开 GitHub issue 联系。
